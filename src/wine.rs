@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 
@@ -59,6 +60,12 @@ pub fn setup(accept_eula: bool, repair: bool) -> Result<()> {
         .arg(if repair { "--update" } else { "--init" })
         .status()
         .context("running wineboot")?;
+    // `wineboot --init` exits before wineserver flushes system.reg/user.reg
+    // to disk (measured ~7s on Wine 11), so a freshly created prefix looks
+    // uninitialized to the check below even though wineboot succeeded.  Wait
+    // for the server to go idle, which is the point at which the registry
+    // files are actually on disk.
+    flush_prefix(&prefix);
     if !status.success() || !prefix_initialized(&prefix) {
         anyhow::bail!("{}", t!("setup.prefix_failed", status = status));
     }
@@ -136,12 +143,16 @@ pub fn webview2_installed(prefix: &Path) -> bool {
         .is_some_and(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0))
 }
 
-/// Read the persisted Wine service registration without starting Wine or
-/// showing component installers from `uur doctor`.
-pub fn client_service_registered(prefix: &Path) -> bool {
-    let Ok(registry) = std::fs::read_to_string(prefix.join("system.reg")) else {
-        return false;
-    };
+/// The Windows service NetEase's installer registers points at
+/// `GameViewerService.exe`.  `GameViewerServer.exe` is a different program —
+/// the streaming/terminal server — and never appears in the service
+/// ImagePath, so matching on it made every provisioning check fail and left
+/// `uur setup` re-downloading and re-installing on an already complete prefix.
+const SERVICE_IMAGE: &str = "gameviewerservice.exe";
+
+/// Extract the `ImagePath` recorded for the UU Windows service from the raw
+/// `system.reg` text.  Kept pure so it can be tested without a Wine prefix.
+fn service_image_path(registry: &str) -> Option<String> {
     let mut service_section = false;
     for line in registry.lines() {
         if let Some(section) = line.strip_prefix('[').and_then(|line| line.split_once(']')) {
@@ -149,11 +160,22 @@ pub fn client_service_registered(prefix: &Path) -> bool {
                 .0
                 .to_ascii_lowercase()
                 .ends_with(r"\\services\\gameviewerservice");
-        } else if service_section && line.starts_with("\"ImagePath\"=") {
-            return line.to_ascii_lowercase().contains("gameviewerserver.exe");
+        } else if service_section {
+            if let Some(value) = line.trim_start().strip_prefix("\"ImagePath\"=") {
+                return Some(value.to_ascii_lowercase());
+            }
         }
     }
-    false
+    None
+}
+
+/// Read the persisted Wine service registration without starting Wine or
+/// showing component installers from `uur doctor`.
+pub fn client_service_registered(prefix: &Path) -> bool {
+    let Ok(registry) = std::fs::read_to_string(prefix.join("system.reg")) else {
+        return false;
+    };
+    service_image_path(&registry).is_some_and(|image| image.contains(SERVICE_IMAGE))
 }
 
 fn query_client_service(prefix: &Path) -> Result<bool> {
@@ -171,10 +193,13 @@ fn query_client_service(prefix: &Path) -> Result<bool> {
         .stdin(Stdio::null())
         .output()
         .context("checking the UU Windows service registration")?;
+    // Wine may record the service under `ControlSet001` and only alias it as
+    // `CurrentControlSet`, and `reg query` output is CRLF; matching the
+    // executable name case-insensitively anywhere in stdout covers both.
     Ok(output.status.success()
         && String::from_utf8_lossy(&output.stdout)
             .to_ascii_lowercase()
-            .contains("gameviewerserver.exe"))
+            .contains(SERVICE_IMAGE))
 }
 
 /// Registry compatibility profile, ported from the field-tested reference
@@ -328,6 +353,42 @@ fn stop_wineserver(prefix: &Path) {
         .env("WINEPREFIX", prefix)
         .arg("-k")
         .status();
+}
+
+/// Block until wineserver has flushed the prefix registry to disk.
+///
+/// `wineboot` returns as soon as it has handed work to wineserver, but
+/// `system.reg`/`user.reg` only appear once the server shuts down.  Without
+/// this barrier a freshly provisioned prefix is misread as broken.  Both waits
+/// are bounded so a stray Wine process cannot hang provisioning.
+fn flush_prefix(prefix: &Path) {
+    if let Ok(mut child) = Command::new("wineserver")
+        .env("WINEPREFIX", prefix)
+        .arg("-w")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+            }
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !prefix_initialized(prefix) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Locate the installed client directory regardless of how NetEase spells
@@ -577,6 +638,7 @@ mod tests {
     use super::find_client_dir;
     use super::log_pixels_command;
     use super::registry_compat_entries;
+    use super::service_image_path;
     use std::path::Path;
     use std::path::PathBuf;
 
@@ -701,6 +763,43 @@ mod tests {
         let prefix = TestPrefix::create();
         std::fs::create_dir_all(prefix.path().join("drive_c/Program Files/Netease")).unwrap();
         assert!(find_client_dir(prefix.path()).is_none());
+    }
+
+    /// Real `system.reg` excerpt written by the NetEase installer, escaped
+    /// exactly as Wine stores it.  The service ImagePath names
+    /// GameViewerService.exe, not GameViewerServer.exe.
+    const INSTALLED_SYSTEM_REG: &str = concat!(
+        "[System\\\\ControlSet001\\\\Services\\\\GameViewerService] 1791878366\n",
+        "#time=1dd5ae8c44b323c\n",
+        "\"DependOnService\"=str(7):\"RpcSs\\0Tcpip\\0NDIS\\0AFD\\0\"\n",
+        "\"DisplayName\"=\"GameViewerService\"\n",
+        "\"ImagePath\"=str(2):\"\\\"C:\\\\Program Files\\\\Netease\\\\GameViewer",
+        "\\\\GameViewerService.exe\\\" --service\"\n",
+        "\"ObjectName\"=\"LocalSystem\"\n",
+        "\"Start\"=dword:00000002\n",
+    );
+
+    #[test]
+    fn service_registration_matches_the_image_the_installer_registers() {
+        // Regression: the check looked for gameviewerserver.exe, which never
+        // appears in the service ImagePath, so a complete install was always
+        // reported as missing and `uur setup` reinstalled on every run.
+        let image = service_image_path(INSTALLED_SYSTEM_REG).expect("ImagePath parsed");
+        assert!(image.contains("gameviewerservice.exe"));
+        assert!(!image.contains("gameviewerserver.exe"));
+    }
+
+    #[test]
+    fn missing_service_section_is_not_registered() {
+        let registry = "[Software\\\\Wine\\\\DllOverrides] 1\n\"winemenubuilder\"=\"\"\n";
+        assert!(service_image_path(registry).is_none());
+    }
+
+    #[test]
+    fn service_section_without_image_path_is_not_registered() {
+        let registry = "[System\\\\ControlSet001\\\\Services\\\\GameViewerService] 1\n\
+                        \"Start\"=dword:00000002\n";
+        assert!(service_image_path(registry).is_none());
     }
 
     #[test]
