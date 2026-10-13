@@ -206,6 +206,47 @@ async fn portal_session(config: &mut Config) -> Result<(OwnedFd, u32)> {
     Err(last_error.unwrap_or_else(|| anyhow!("portal session failed")))
 }
 
+/// Choose a cursor mode from the flags the portal advertises.
+///
+/// `Embedded` is what the capture path wants (the hook composites the cursor
+/// itself on X11, and an embedded cursor is the closest match elsewhere), then
+/// `Hidden`, then `Metadata`.  `None` means the portal advertised no usable
+/// mode at all.
+fn choose_cursor_mode(
+    available: ashpd::enumflags2::BitFlags<ashpd::desktop::screencast::CursorMode>,
+) -> Option<ashpd::desktop::screencast::CursorMode> {
+    use ashpd::desktop::screencast::CursorMode;
+    [
+        CursorMode::Embedded,
+        CursorMode::Hidden,
+        CursorMode::Metadata,
+    ]
+    .into_iter()
+    .find(|mode| available.contains(*mode))
+}
+
+/// Pick a cursor mode the portal actually advertises.
+///
+/// `SelectSources` rejects a mode outside the portal's `AvailableCursorModes`
+/// with `InvalidArgument: Unavailable cursor mode N`.  A portal frontend whose
+/// backend property cache is empty reports a zeroed set and rejects every
+/// mode, so choosing from the advertised flags keeps capture working on
+/// backends that offer only a subset and turns the unusable case into an
+/// actionable message instead of a raw D-Bus error.
+pub(crate) async fn preferred_cursor_mode(
+    screencast: &ashpd::desktop::screencast::Screencast<'_>,
+) -> Result<ashpd::desktop::screencast::CursorMode> {
+    use ashpd::desktop::screencast::CursorMode;
+
+    let available = match screencast.available_cursor_modes().await {
+        Ok(modes) => modes,
+        // ScreenCast v2 introduced the property; older portals have no
+        // advertisement to consult, so keep the historical request.
+        Err(_) => return Ok(CursorMode::Embedded),
+    };
+    choose_cursor_mode(available).ok_or_else(|| anyhow!("{}", t!("capture.cursor_unsupported")))
+}
+
 /// One full portal handshake.  Returns the PipeWire fd, the video node id
 /// and the restore token the portal issued for this selection.
 async fn negotiate(
@@ -213,15 +254,15 @@ async fn negotiate(
     source: ashpd::desktop::screencast::SourceType,
     restore_token: Option<&str>,
 ) -> Result<(OwnedFd, u32, Option<String>)> {
-    use ashpd::desktop::screencast::CursorMode;
     use ashpd::desktop::PersistMode;
 
     let session = screencast.create_session().await?;
+    let cursor_mode = preferred_cursor_mode(screencast).await?;
 
     screencast
         .select_sources(
             &session,
-            CursorMode::Embedded,
+            cursor_mode,
             source.into(),
             false,
             restore_token,
@@ -288,13 +329,48 @@ fn find_helper(name: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use super::choose_cursor_mode;
     use super::source_type;
-    use ashpd::desktop::screencast::SourceType;
+    use ashpd::desktop::screencast::{CursorMode, SourceType};
+    use ashpd::enumflags2::BitFlags;
 
     #[test]
     fn configured_portal_source_is_mapped() {
         assert_eq!(source_type("monitor"), SourceType::Monitor);
         assert_eq!(source_type("window"), SourceType::Window);
         assert_eq!(source_type("virtual"), SourceType::Virtual);
+    }
+
+    #[test]
+    fn embedded_cursor_is_preferred_when_the_portal_offers_it() {
+        // gnome advertises 7 = Hidden | Embedded | Metadata.
+        let available = CursorMode::Hidden | CursorMode::Embedded | CursorMode::Metadata;
+        assert_eq!(choose_cursor_mode(available), Some(CursorMode::Embedded));
+    }
+
+    #[test]
+    fn a_backend_without_embedded_cursor_falls_back_instead_of_failing() {
+        // wlr advertises 3 = Hidden | Embedded; a metadata-only backend must
+        // still capture rather than requesting a mode the portal rejects.
+        assert_eq!(
+            choose_cursor_mode(CursorMode::Metadata.into()),
+            Some(CursorMode::Metadata)
+        );
+        assert_eq!(
+            choose_cursor_mode(CursorMode::Hidden.into()),
+            Some(CursorMode::Hidden)
+        );
+        assert_eq!(
+            choose_cursor_mode(CursorMode::Hidden | CursorMode::Metadata),
+            Some(CursorMode::Hidden)
+        );
+    }
+
+    #[test]
+    fn an_empty_advertisement_selects_no_mode() {
+        // Regression: a portal frontend with a zeroed backend property cache
+        // reported AvailableCursorModes = 0 and rejected every request with
+        // "InvalidArgument: Unavailable cursor mode 2".
+        assert_eq!(choose_cursor_mode(BitFlags::empty()), None);
     }
 }

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop};
-use ashpd::desktop::screencast::{CursorMode, Screencast};
+use ashpd::desktop::screencast::Screencast;
 use ashpd::desktop::PersistMode;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -140,7 +140,7 @@ async fn portal_worker(
     screencast
         .select_sources(
             &session,
-            CursorMode::Embedded,
+            crate::capture::preferred_cursor_mode(&screencast).await?,
             source.into(),
             false,
             None,
