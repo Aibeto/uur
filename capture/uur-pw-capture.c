@@ -28,6 +28,7 @@
 
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
+#include <drm/drm_fourcc.h>
 #include "../hook/frame-protocol.h"
 
 #define FRAME_FORMAT_BGRX 1
@@ -63,6 +64,7 @@ struct capture {
     int shm_fd;
     uint8_t *shm;
     size_t shm_size;
+    int dmabuf_usable;
     char frame_path[PATH_MAX];
 };
 
@@ -198,15 +200,40 @@ static void on_process(void *userdata)
             pw_stream_queue_buffer(c->stream, buffer);
             return;
         }
+        /* Bytes the frame occupies at the negotiated geometry.  DMA-BUF
+         * producers leave both chunk->size and maxsize at 1, so the extent
+         * has to come from the negotiated stride and height. */
+        size_t frame_bytes = (size_t)c->stride * c->height;
+
         if (plane->data != NULL) {
             pixels = plane->data + plane->chunk->offset;
+        } else if (plane->type == SPA_DATA_DmaBuf && plane->fd >= 0) {
+            /* niri always delivers DMA-BUF here.  The session negotiated
+             * DRM_FORMAT_MOD_LINEAR, so the fd is directly mappable without
+             * GBM/EGL; a tiled modifier would need an importer instead. */
+            if (!c->dmabuf_usable) {
+                pw_stream_queue_buffer(c->stream, buffer);
+                return;
+            }
+            size_t want = plane->maxsize > frame_bytes ? plane->maxsize
+                                                       : frame_bytes;
+            mapping = mmap(NULL, want, PROT_READ, MAP_SHARED, plane->fd, 0);
+            if (mapping == MAP_FAILED) {
+                static int once = 0;
+                if (!once++)
+                    fprintf(stderr, "dmabuf mmap failed: %s (fd=%d size=%zu)\n",
+                            strerror(errno), (int)plane->fd, want);
+            } else {
+                mapping_size = want;
+                pixels = (uint8_t *)mapping + plane->chunk->offset;
+            }
         } else if (plane->type == SPA_DATA_MemFd && plane->fd >= 0) {
             long page_size = sysconf(_SC_PAGESIZE);
             uint64_t offset = (uint64_t)plane->mapoffset + plane->chunk->offset;
             uint64_t page_mask = (uint64_t)(page_size > 0 ? page_size : 4096) - 1;
             off_t aligned = (off_t)(offset & ~page_mask);
             size_t delta = (size_t)(offset - (uint64_t)aligned);
-            mapping_size = delta + plane->chunk->size;
+            mapping_size = delta + frame_bytes;
             mapping = mmap(NULL, mapping_size, PROT_READ, MAP_PRIVATE,
                            plane->fd, aligned);
             if (mapping != MAP_FAILED)
@@ -220,7 +247,14 @@ static void on_process(void *userdata)
                                              c->format == SPA_VIDEO_FORMAT_RGB
                                          ? c->width * 3
                                          : c->width * 4);
-            uint32_t rows = stride > 0 ? plane->chunk->size / stride : 0;
+            uint32_t rows = c->height;
+            if (stride > 0) {
+                size_t span = plane->chunk->size > stride ? plane->chunk->size
+                                                          : frame_bytes;
+                uint32_t from_span = (uint32_t)(span / stride);
+                if (from_span < rows)
+                    rows = from_span;
+            }
             publish_frame(c, pixels, stride, rows);
             if (mapping != MAP_FAILED)
                 munmap(mapping, mapping_size);
@@ -254,8 +288,14 @@ static void on_param_changed(void *userdata, uint32_t id,
     c->height = (uint32_t)info.size.height;
     c->format = info.format;
     c->stride = SPA_ROUND_UP_N(c->width * 4, 4);
-    fprintf(stderr, "negotiated: %ux%u stride %u\n", c->width, c->height,
-            c->stride);
+    /* The DMA-BUF path mmaps the fd directly, which is only correct for a
+     * linear layout.  A tiled modifier needs a real importer (GBM/EGL), so
+     * refuse to publish garbage rather than emit a corrupt frame. */
+    c->dmabuf_usable = info.modifier == DRM_FORMAT_MOD_LINEAR ||
+                       info.modifier == DRM_FORMAT_MOD_INVALID;
+    fprintf(stderr, "negotiated: %ux%u stride %u modifier %#llx%s\n", c->width,
+            c->height, c->stride, (unsigned long long)info.modifier,
+            c->dmabuf_usable ? "" : " (not linear; capture cannot map it)");
 
     if (c->shm == NULL && shm_setup(c) < 0) {
         pw_main_loop_quit(c->loop);
@@ -355,7 +395,14 @@ int main(void)
                                SPA_VIDEO_FORMAT_RGBx,
                                SPA_VIDEO_FORMAT_RGBA,
                                SPA_VIDEO_FORMAT_BGR,
-                               SPA_VIDEO_FORMAT_RGB));
+                               SPA_VIDEO_FORMAT_RGB),
+        /* Some compositors (niri) mark the modifier MANDATORY, and SPA
+         * filtering fails unless both sides carry the property -- which
+         * surfaces as "no more input formats".  Offer LINEAR, the layout the
+         * frame protocol assumes. */
+        SPA_FORMAT_VIDEO_modifier,
+        SPA_POD_CHOICE_ENUM_Long(2, DRM_FORMAT_MOD_LINEAR,
+                                 DRM_FORMAT_MOD_INVALID));
 
     if (pw_stream_connect(c.stream, PW_DIRECTION_INPUT, node_id,
                           PW_STREAM_FLAG_MAP_BUFFERS |
