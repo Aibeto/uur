@@ -50,7 +50,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             appstream binutils-mingw-w64-x86-64 desktop-file-utils \
-            gcc gcc-mingw-w64-x86-64 libpipewire-0.3-dev pkg-config \
+            gcc gcc-mingw-w64-x86-64 libpipewire-0.3-dev libwayland-dev pkg-config \
             wine xvfb
       - name: Build and stage
         run: |

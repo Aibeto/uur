@@ -24,7 +24,11 @@ pub trait InputBackend: Send {
 ///   kernel-level uinput device when the compositor only provides ScreenCast.
 /// - X11 sessions use XTEST, which needs no extra privileges.
 pub fn select(preferred: &str) -> Result<Box<dyn InputBackend>> {
-    let on_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+    let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|session| session == "wayland");
+    if !matches!(preferred, "auto" | "portal" | "uinput" | "xtest") {
+        anyhow::bail!("unknown input backend {preferred:?}; use auto, portal, uinput, or xtest");
+    }
 
     if preferred == "portal" || (preferred == "auto" && on_wayland) {
         match portal::PortalBackend::connect() {
@@ -39,9 +43,11 @@ pub fn select(preferred: &str) -> Result<Box<dyn InputBackend>> {
             Err(error) if preferred == "uinput" => return Err(error),
             Err(error) => {
                 eprintln!("{}: {error}", t!("input.uinput_unavailable"));
-                // fall through to XTEST: partial reachability beats nothing
             }
         }
+    }
+    if on_wayland && preferred == "auto" {
+        anyhow::bail!("{}", t!("input.wayland_no_full_input"));
     }
     if std::env::var("DISPLAY").is_ok() {
         return Ok(Box::new(xtest::XtestBackend::connect()?));

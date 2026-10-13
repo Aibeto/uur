@@ -24,6 +24,7 @@ overrides:
       - wine
       - curl
       - libpipewire-0.3-0
+      - libwayland-client0
       - xdg-desktop-portal
     recommends:
       - xdg-desktop-portal-gnome | xdg-desktop-portal-kde | xdg-desktop-portal-wlr
@@ -40,6 +41,7 @@ overrides:
       - wine
       - curl
       - pipewire-libs
+      - wayland-libs
       - xdg-desktop-portal
     recommends:
       - ethtool

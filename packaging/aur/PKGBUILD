@@ -21,9 +21,10 @@ depends=(
     'wine'
     'curl'
     'pipewire'
+    'wayland'
     'xdg-desktop-portal'
 )
-makedepends=('cargo' 'gcc' 'pkgconf' 'mingw-w64-gcc' 'mingw-w64-binutils')
+makedepends=('cargo' 'gcc' 'pkgconf' 'wayland' 'mingw-w64-gcc' 'mingw-w64-binutils')
 optdepends=(
     'osslsigncode: Authenticode verification of official updater downloads'
     'xdg-desktop-portal-gnome: GNOME, niri, and compatible Wayland capture/input'

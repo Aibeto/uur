@@ -38,7 +38,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            binutils-mingw-w64-x86-64 gcc libpipewire-0.3-dev \
+            binutils-mingw-w64-x86-64 gcc libpipewire-0.3-dev libwayland-dev \
             gcc-mingw-w64-x86-64 pkg-config zstd
       - name: Install nFPM
         env:
@@ -73,7 +73,7 @@ jobs:
       - name: Install Arch build dependencies
         run: |
           pacman -Syu --noconfirm \
-            cargo rust gcc pkgconf pipewire \
+            cargo rust gcc pkgconf pipewire wayland \
             mingw-w64-gcc mingw-w64-binutils
       - name: Build native pacman package with makepkg
         run: |

@@ -12,4 +12,5 @@ printf '%s\n' \
     'The setup command downloads the official client from NetEase.' \
     'The --accept-eula flag records that you accepted the upstream EULA.' \
     'Run setup without that flag only when you want to read the EULA URL first.'
+printf 'To remove user data completely, run %s uninstall --purge before removing the system package.\n' "$command_name"
 printf '\n'

@@ -10,6 +10,8 @@ install -Dm0755 "$uur_binary" \
     "$destination$prefix/bin/uur"
 install -Dm0755 "$project_root/capture/uur-pw-capture" \
     "$destination$prefix/lib/uur/uur-pw-capture"
+install -Dm0755 "$project_root/capture/uur-wl-capture" \
+    "$destination$prefix/lib/uur/uur-wl-capture"
 install -Dm0755 "$project_root/packaging/post-install-message" \
     "$destination$prefix/lib/uur/post-install-message"
 for component in wevtapi.dll uur-hook.dll wtsapi32.dll winlogon.exe uur-terminal-proxy.exe uur-mux-proxy.exe uur-launch-proxy.exe; do
@@ -30,3 +32,5 @@ install -Dm0644 "$project_root/LICENSE" \
     "$destination$prefix/share/licenses/uur/LICENSE"
 install -Dm0644 "$project_root/NOTICE" \
     "$destination$prefix/share/licenses/uur/NOTICE"
+install -Dm0644 "$project_root/capture/wlr-screencopy-unstable-v1.xml" \
+    "$destination$prefix/share/licenses/uur/wlr-screencopy-unstable-v1.xml"

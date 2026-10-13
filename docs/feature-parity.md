@@ -5,7 +5,7 @@
 | Control other devices | available | Official UU UI and decoder under Wine |
 | Receive remote video | available | Official UU UI under Wine |
 | Share X11 desktop | available | Wine X11 capture |
-| Share Wayland desktop | available | ScreenCast portal → PipeWire → GDI adapter |
+| Share Wayland desktop | available | ScreenCast/PipeWire or explicitly enabled native screencopy → GDI adapter |
 | Mouse and keyboard | implemented | RemoteDesktop portal → uinput → XTest capability order |
 | X11 multi-monitor | Wine integration | Native Wine/XRandR display topology |
 | Wayland monitor/window selection | available | Persistent portal source selection |
@@ -14,7 +14,7 @@
 | Clipboard and phone IME text | planned | RemoteDesktop Clipboard portal, then X11 fallback |
 | Speaker and microphone audio | available through Wine | PulseAudio, pipewire-pulse, or ALSA selected from live capabilities |
 | System-audio loopback and remote mute | Wine integration | WASAPI → winepulse/winealsa |
-| Native tray | Wine baseline | Official tray, with StatusNotifierItem as the native route |
+| Native tray | implemented | StatusNotifierItem + DBusMenu, supervised with the session; no Wine XEmbed dependency |
 | Terminal | available | ConPTY/mux ABI adapters → authenticated native Rust PTY/login shell |
 | Quick Launch | implemented | Windows app inventory adapter → XDG desktop catalog → `gio launch` |
 | Desktop wallpaper | available | Capability providers → Wine desktop metadata |

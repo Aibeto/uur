@@ -12,7 +12,7 @@ const UI_SET_EVBIT: libc::Ioctl = 0x4004_5564_u64 as libc::Ioctl;
 const UI_SET_KEYBIT: libc::Ioctl = 0x4004_5565_u64 as libc::Ioctl;
 const UI_SET_RELBIT: libc::Ioctl = 0x4004_5566_u64 as libc::Ioctl;
 const UI_SET_ABSBIT: libc::Ioctl = 0x4004_5567_u64 as libc::Ioctl;
-// struct uinput_setup = name[80] + input_id(8) + ff_effects_max(4) = 92 bytes
+// struct uinput_setup = input_id(8) + name[80] + ff_effects_max(4) = 92 bytes
 const UI_DEV_SETUP: libc::Ioctl = 0x405C_5503_u64 as libc::Ioctl;
 // struct uinput_abs_setup = u16 code + input_absinfo(24) = 28 bytes
 const UI_ABS_SETUP: libc::Ioctl = 0x401C_5504_u64 as libc::Ioctl;
@@ -40,6 +40,8 @@ const BTN_MIDDLE: u16 = 0x112;
 const BTN_SIDE: u16 = 0x116;
 const BTN_EXTRA: u16 = 0x117;
 const BTN_TOOL_PEN: u16 = 0x140;
+const BTN_TOUCH: u16 = 0x14a;
+const BTN_STYLUS: u16 = 0x14b;
 
 const BUS_VIRTUAL: u16 = 0x06;
 
@@ -53,14 +55,14 @@ struct InputEvent {
     value: i32,
 }
 
-/// struct uinput_setup: name[80] + input_id(4×u16) + ff_effects_max(u32).
+/// Linux ABI: input_id(4×u16), then name[80], then ff_effects_max(u32).
 #[repr(C)]
 struct UinputSetup {
-    name: [u8; 80],
     bustype: u16,
     vendor: u16,
     product: u16,
     version: u16,
+    name: [u8; 80],
     ff_effects_max: u32,
 }
 
@@ -142,7 +144,9 @@ impl UinputDevice {
             maximum,
             fuzz: 0,
             flat: 0,
-            resolution: 0,
+            // libinput requires physical axis resolution for tablets. A
+            // 65.535 mm virtual surface maps the full normalized range.
+            resolution: 1000,
         };
         let rc = unsafe { libc::ioctl(self.file.as_raw_fd(), UI_ABS_SETUP, &setup) };
         if rc < 0 {
@@ -235,6 +239,8 @@ impl Devices {
         ioctl_u32(&tablet.file, UI_SET_EVBIT, EV_ABS as u32)?;
         ioctl_u32(&tablet.file, UI_SET_EVBIT, EV_SYN as u32)?;
         tablet.keybit(BTN_TOOL_PEN)?;
+        tablet.keybit(BTN_TOUCH)?;
+        tablet.keybit(BTN_STYLUS)?;
         tablet.absbit(ABS_X, 65535)?;
         tablet.absbit(ABS_Y, 65535)?;
         tablet.finish()?;

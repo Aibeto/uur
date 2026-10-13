@@ -4,9 +4,17 @@ doctor:
   no_portal_backend: "no xdg-desktop-portal backend found (Wayland capture/input unavailable)"
   present: "present"
   backend_x11: "X11 session: XTEST injection"
-  backend_wayland: "Wayland session: kernel uinput injection (portal path in development)"
+  backend_wayland: "Wayland session: kernel uinput injection"
   backend_portal: "Wayland session: standard RemoteDesktop portal"
   backend_none: "no graphical session detected"
+  backend_partial: "XWayland windows only; native Wayland desktop input requires portal or uinput"
+  backend_wayland_missing: "full desktop input unavailable; check RemoteDesktop authorization or /dev/uinput access"
+  client_incomplete: "client or server executable missing; run uur setup --repair"
+  service_registered: "registered; successful startup is checked by uur run"
+  service_missing: "missing service registration; run uur setup --repair"
+  webview_pending: "not installed; uur run will invoke the bundled WebView2 installer"
+  portal_capture_advertised: "source types advertised; authorization and real frames are checked by uur run"
+  portal_input_advertised: "keyboard and pointer advertised; session authorization is checked by uur run"
   uinput_module: "device present but kernel module not loaded (install the packaged udev rule + modules-load entry, then reboot)"
   uinput_permission: "not writable by this user (needs the uur udev uaccess rule or the input group)"
   uinput_missing: "/dev/uinput missing from this kernel"
@@ -16,12 +24,13 @@ doctor:
   launcher_missing: "Win64 Quick Launch proxy missing; reinstall uur"
   xdg_launcher_missing: "install GLib's gio or gtk-launch"
   wallpaper_missing: "not detected; set UUR_WALLPAPER to an image path"
-  footer: "Everything above is advisory. Run `uur setup` to provision the managed client."
+  footer: "This report checks installation files and advertised capabilities. uur run verifies the input session, Wayland frames, and Windows service startup. Use uur setup --repair to retry Wine initialization after an interrupted installation."
 
 input:
   portal_unavailable: "Wayland portal input is not available in this session"
   no_display: "no graphical session detected (DISPLAY and WAYLAND_DISPLAY are unset)"
-  uinput_unavailable: "uinput not writable — falling back to XTEST (XWayland scope only; load the uinput module or add the udev rule for full coverage)"
+  uinput_unavailable: "kernel uinput injection unavailable"
+  wayland_no_full_input: "Wayland desktop input requires a working RemoteDesktop portal or writable /dev/uinput. Check the packaged udev rule and uinput module. Explicit xtest is limited to XWayland windows."
 
 bridge:
   listening: "input bridge listening on 127.0.0.1:%{port}"
@@ -42,6 +51,9 @@ upstream:
   not_provisioned: "no provisioned client found; run `uur setup`"
 
 capture:
+  direct_enabled: "Direct Wayland monitor capture explicitly enabled; it uses uinput and does not show a portal consent dialog. Use uur display backend portal to restore portal capture."
+  portal_enabled: "Portal-consented capture enabled"
+  direct_started: "direct Wayland monitor capture started"
   session_ready: "portal session ready (video node %{node}); streaming to the private runtime transport"
   helper_failed: "the capture helper exited with an error"
 
@@ -56,6 +68,10 @@ session:
   quick_launch_ready: "%{count} Linux applications exported to UU Quick Launch"
   audio_backend: "Wine audio backend: %{backend}"
   wine_dpi: "Wine system DPI set from Xft.dpi: %{dpi}"
+  waiting_capture: "waiting for the first Wayland capture frame; select a monitor in the portal dialog"
+  waiting_direct_capture: "waiting for the first direct Wayland monitor frame"
+  capture_not_ready: "No Wayland frames arrived within 120 seconds. Check the ScreenCast portal and PipeWire; select an actual monitor rather than an unassigned dynamic cast target. See the session log."
+  service_failed: "GameViewerService did not start. Run uur setup --repair and inspect ~/.local/state/uur/session.log and ~/.local/share/uur/hook.log."
 
 setup:
   eula_prompt: "The official UU Remote client will be downloaded from NetEase and is governed by their EULA: %{url}\nRe-run with --accept-eula to continue."
@@ -65,9 +81,33 @@ setup:
   downloading: "downloading the official installer from %{url}"
   download_failed: "the official installer download failed"
   initializing_prefix: "initializing the managed Wine prefix"
+  prefix_failed: "Wine prefix initialization failed (%{status}); run uur setup --repair after resolving the Wine error"
+  repaired: "Wine prefix updated and client installation verified at %{path}"
+  install_failed: "The official installer failed or was cancelled (%{status}); installation is incomplete. Retry with uur setup --repair."
+  client_incomplete: "The installer did not provide both GameViewer.exe and GameViewerServer.exe; retry with uur setup --repair"
+  service_incomplete: "GameViewerService has no valid registered executable; run uur setup --repair"
   installing_client: "installing the official client (silent mode)"
   silent_install_unavailable: "the installer ignored silent mode; complete its window manually if it opened"
   done: "provisioned into %{path}"
+
+tray:
+  title: "UU Remote"
+  tooltip: "UU Remote for Linux"
+  open: "Open UU Remote"
+  quit: "Quit"
+  registered: "native desktop tray registered"
+
+uninstall:
+  no_root: "Run uur uninstall as the desktop user, without sudo. Remove the system package separately with its package manager."
+  plan: "Removal plan (directories include their contents):"
+  purge_warning: "This permanently deletes the managed client, login/account data, Wine environment, installer cache, configuration and logs."
+  keep_data: "Client/account data, configuration and logs will be kept. Use --purge to remove them too."
+  package_hint: "System package files and shared dependencies are left to the package manager. On Arch, run sudo pacman -Rns uur after this command."
+  dry_run: "Preview only; no processes were stopped and no files were changed."
+  confirm_required: "No terminal is available for confirmation. Review --dry-run, then pass --yes to confirm removal."
+  confirm: "Proceed with removal? [y/N]"
+  cancelled: "Cancelled; no files were changed."
+  done: "The selected user files and recognized source-installation files have been removed."
 
 autostart:
   enabled: "login autostart enabled: %{path}"

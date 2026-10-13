@@ -151,12 +151,24 @@ uur autostart disable   # Remove the managed login entry
 uur wol status          # Inspect the physical wired adapter's WOL state
 uur display status      # Monitor, window, or portal virtual source
 uur display source virtual
+uur display outputs     # Native Wayland output names
 uur stop                # Stop only uur's helpers and Wine prefix
+uur uninstall --purge --dry-run  # Preview complete user-data cleanup
+uur uninstall --purge   # Confirm cleanup before removing the system package
 ```
 
 If UU was started from the desktop, choose **Quit** from the launcher's
 application actions. When running from a terminal, use `uur stop` or press
 Ctrl+C.
+
+On niri, uur provides a native tray and an explicitly enabled direct capture
+path: `uur display backend wayland --output DP-1` (use your output name).
+This uses uinput and captures the chosen monitor without a portal dialog.
+Return to system-consented capture with `uur display backend portal`.
+
+Package removal alone preserves the Wine prefix and account data. See
+[complete removal](docs/distribution.md#package-removal-repair-and-per-user-state)
+for the user-cleanup and package-manager steps.
 
 Diagnostic input overrides:
 

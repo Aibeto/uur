@@ -15,6 +15,8 @@ mod protocol;
 mod proxy;
 mod session;
 mod terminal;
+mod tray;
+mod uninstall;
 mod upstream;
 mod video;
 mod wallpaper;
@@ -46,6 +48,9 @@ enum Command {
         /// Accept the NetEase UU Remote EULA non-interactively.
         #[arg(long)]
         accept_eula: bool,
+        /// Update the existing Wine prefix, retry Wine components, and repair an incomplete client installation.
+        #[arg(long)]
+        repair: bool,
     },
     /// Print the live environment report (sessions, wine, portals, backends).
     Doctor,
@@ -57,6 +62,18 @@ enum Command {
     Run,
     /// Stop every uur-owned process and the managed Wine prefix.
     Stop,
+    /// Remove this user's integration and source installation; optionally erase all managed data.
+    Uninstall {
+        /// Delete the managed Wine prefix, account data, installer cache, configuration and logs.
+        #[arg(long)]
+        purge: bool,
+        /// Show the exact removal plan without stopping processes or changing files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm removal without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Manage optional XDG login autostart.
     Autostart {
         #[command(subcommand)]
@@ -87,6 +104,9 @@ enum Command {
     /// Internal desktop suspend/idle inhibitor. Not part of the public CLI.
     #[command(hide = true, name = "__inhibit")]
     InternalInhibit,
+    /// Internal native desktop tray. Not part of the public CLI.
+    #[command(hide = true, name = "__tray")]
+    InternalTray,
     /// Internal authenticated XDG application launcher.
     #[command(hide = true, name = "__launcher")]
     InternalLauncher,
@@ -138,6 +158,21 @@ enum DisplayAction {
     Status,
     /// Use a monitor, one window, or a portal-provided virtual display.
     Source { source: DisplaySource },
+    /// Choose portal capture, or explicitly enable direct Wayland monitor capture.
+    Backend {
+        backend: CaptureBackend,
+        /// Name from `uur display outputs`; required if more than one output is present.
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// List native Wayland outputs without capturing their content.
+    Outputs,
+}
+
+#[derive(Clone, ValueEnum)]
+enum CaptureBackend {
+    Portal,
+    Wayland,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -165,12 +200,20 @@ fn main() -> Result<()> {
     i18n::init();
     let cli = Cli::parse();
     match cli.command {
-        Command::Setup { accept_eula } => wine::setup(accept_eula),
+        Command::Setup {
+            accept_eula,
+            repair,
+        } => wine::setup(accept_eula, repair),
         Command::Doctor => doctor::report(),
         Command::Pointer => bridge::print_pointer(),
-        Command::Capture => capture::run(),
+        Command::Capture => capture::run_standalone(),
         Command::Run => session::start(),
         Command::Stop => session::stop(),
+        Command::Uninstall {
+            purge,
+            dry_run,
+            yes,
+        } => uninstall::run(purge, dry_run, yes),
         Command::Autostart { action } => match action {
             AutostartAction::Enable => autostart::enable(),
             AutostartAction::Disable => autostart::disable(),
@@ -182,12 +225,43 @@ fn main() -> Result<()> {
             WolAction::Disable { interface } => wol::configure(interface.as_deref(), false),
         },
         Command::Display { action } => {
+            if matches!(action, DisplayAction::Outputs) {
+                return capture::list_wayland_outputs();
+            }
             let mut config = config::Config::load()?;
             match action {
                 DisplayAction::Status => {
                     println!("{}", t!("display.status", source = config.capture_source));
+                    println!("capture backend: {}", config.capture_backend);
+                    if let Some(output) = &config.capture_output {
+                        println!("output: {output}");
+                    }
                     Ok(())
                 }
+                DisplayAction::Backend { backend, output } => {
+                    config.capture_backend = match backend {
+                        CaptureBackend::Portal => "portal",
+                        CaptureBackend::Wayland => "wayland",
+                    }
+                    .into();
+                    config.capture_output = output;
+                    if config.capture_backend == "wayland" {
+                        config.capture_source = "monitor".into();
+                    }
+                    config.capture_restore_token = None;
+                    config.remote_desktop_restore_token = None;
+                    config.store()?;
+                    println!(
+                        "{}",
+                        if config.capture_backend == "wayland" {
+                            t!("capture.direct_enabled").to_string()
+                        } else {
+                            t!("capture.portal_enabled").to_string()
+                        }
+                    );
+                    Ok(())
+                }
+                DisplayAction::Outputs => unreachable!(),
                 DisplayAction::Source { source } => {
                     config.capture_source = source.as_str().to_string();
                     config.capture_restore_token = None;
@@ -203,6 +277,7 @@ fn main() -> Result<()> {
         Command::InternalTerminal => terminal::serve(),
         Command::InternalWallpaper => wallpaper::serve(),
         Command::InternalInhibit => inhibit::serve(),
+        Command::InternalTray => tray::serve(),
         Command::InternalLauncher => launcher::serve(),
         Command::Upstream {
             action: UpstreamAction::Check,

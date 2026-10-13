@@ -1,5 +1,9 @@
 uur is original code, MIT licensed.
 
+The vendored wlr-screencopy protocol is MIT licensed, copyright Simon Ser
+(2018) and Andri Yngvason (2019). Its full license is preserved in
+capture/wlr-screencopy-unstable-v1.xml.
+
 Design ideas were learned from and are credited to:
 - GuoWQ222/uu-remote-for-linux (0BSD) — the wevtapi preload chain and the
   PipeWire/portal approach to Wayland capture.

@@ -133,8 +133,16 @@ pub fn print_pointer() -> Result<()> {
 /// input events without holding the backend lock while waiting for records.
 pub fn serve() -> Result<()> {
     let config = Config::load()?;
-    let preferred =
+    let mut preferred =
         std::env::var("UUR_INPUT_BACKEND").unwrap_or_else(|_| config.input_backend.clone());
+    if config.capture_backend == "wayland" {
+        if preferred == "auto" {
+            preferred = "uinput".into();
+        }
+        if preferred == "portal" {
+            anyhow::bail!("direct Wayland capture uses uinput; choose UUR_INPUT_BACKEND=uinput or return to portal capture");
+        }
+    }
     let selected = input::select(&preferred)?;
     if let Some(path) = std::env::var_os("UUR_BACKEND_STATUS") {
         std::fs::write(path, selected.name()).context("writing backend status")?;

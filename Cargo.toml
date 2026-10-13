@@ -21,6 +21,8 @@ libc = "0.2"
 input-linux-sys = "0.9"
 x11rb = { version = "0.13", features = ["xtest"] }
 signal-hook = "0.3"
+png = "0.18"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [profile.release]
 lto = true

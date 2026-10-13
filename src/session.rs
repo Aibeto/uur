@@ -251,8 +251,7 @@ fn webview2_install_command(prefix: &Path, bootstrapper: &Path) -> Command {
 }
 
 fn ensure_webview2(prefix: &Path, install_dir: &Path) -> Result<()> {
-    let marker = prefix.join("drive_c/Program Files (x86)/Microsoft/EdgeWebView/Application");
-    if marker.exists() {
+    if crate::wine::webview2_installed(prefix) {
         return Ok(());
     }
     let bootstrapper = install_dir
@@ -265,7 +264,7 @@ fn ensure_webview2(prefix: &Path, install_dir: &Path) -> Result<()> {
     let status = webview2_install_command(prefix, &bootstrapper)
         .status()
         .context("running the WebView2 bootstrapper")?;
-    if !status.success() {
+    if !status.success() || !crate::wine::webview2_installed(prefix) {
         anyhow::bail!("{}", t!("session.webview_failed"));
     }
     Ok(())
@@ -274,7 +273,7 @@ fn ensure_webview2(prefix: &Path, install_dir: &Path) -> Result<()> {
 /// Single-instance guard: an flock held for the lifetime of the session.
 /// A second click on the launcher exits with a clear message instead of
 /// fighting over the bridge port.
-fn acquire_session_lock() -> Result<std::fs::File> {
+pub(crate) fn acquire_session_lock() -> Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
     let state = std::env::var("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -306,6 +305,7 @@ fn acquire_session_lock() -> Result<std::fs::File> {
 
 struct ManagedChild {
     child: Child,
+    name: String,
     terminated: bool,
 }
 
@@ -326,8 +326,19 @@ impl ManagedChild {
             .with_context(|| format!("starting internal helper {argument}"))?;
         Ok(Self {
             child,
+            name: argument.to_string(),
             terminated: false,
         })
+    }
+
+    fn ensure_running(&mut self) -> Result<()> {
+        if let Some(status) = self.child.try_wait()? {
+            anyhow::bail!(
+                "helper {} exited ({status}); see $XDG_STATE_HOME/uur/session.log (normally ~/.local/state/uur/session.log)",
+                self.name
+            );
+        }
+        Ok(())
     }
 
     fn terminate(&mut self) {
@@ -392,6 +403,18 @@ impl SessionResources {
             let _ = std::fs::remove_file(path);
         }
     }
+
+    fn check_required_helpers(&mut self) -> Result<()> {
+        for helper in &mut self.helpers {
+            if matches!(
+                helper.name.as_str(),
+                "__bridge" | "__capture" | "__terminal" | "__launcher"
+            ) {
+                helper.ensure_running()?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for SessionResources {
@@ -405,9 +428,15 @@ pub fn start() -> Result<()> {
     let _session_lock = acquire_session_lock()?;
     rotate_session_log();
     let config = Config::load()?;
+    let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|session| session == "wayland");
     let prefix = data_dir()?.join("wine");
     let install_dir = crate::wine::find_client_dir(&prefix)
-        .context("client not provisioned; run `uur setup` first")?;
+        .context("client installation incomplete; run `uur setup --repair` first")?;
+    if !crate::wine::client_service_registered(&prefix) {
+        anyhow::bail!("{}", t!("setup.service_incomplete"));
+    }
+    let mut resources = SessionResources::new(prefix.clone());
     if let Some(dpi) = xft_dpi() {
         match crate::wine::set_log_pixels(&prefix, dpi) {
             Ok(()) => println!("{}", t!("session.wine_dpi", dpi = dpi)),
@@ -428,6 +457,11 @@ pub fn start() -> Result<()> {
     // Bridge configuration as a file inside the prefix: any process the
     // Wine service manager respawns reads it, env or not.
     let frames = frame_path()?;
+    match std::fs::remove_file(&frames) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("removing the previous capture transport"),
+    }
     let backend_status = crate::config::runtime_dir()?.join("backend");
     let _ = std::fs::remove_file(&backend_status);
     std::env::set_var("UUR_FRAME_PATH", &frames);
@@ -464,7 +498,10 @@ pub fn start() -> Result<()> {
     signal_hook::flag::register(signal_hook::consts::SIGHUP, stopping.clone())?;
 
     let log = open_session_log()?;
-    let mut resources = SessionResources::new(prefix.clone());
+    match ManagedChild::spawn_internal("__tray", &log) {
+        Ok(helper) => resources.helpers.push(helper),
+        Err(error) => eprintln!("native tray unavailable: {error}"),
+    }
     let _ = std::fs::remove_file(&terminal_config);
     std::env::set_var("UUR_TERMINAL_CONFIG", &terminal_config);
     resources.cleanup_files.push(terminal_config.clone());
@@ -489,13 +526,28 @@ pub fn start() -> Result<()> {
     resources
         .helpers
         .push(ManagedChild::spawn_internal("__bridge", &log)?);
-    wait_for_bridge(config.bridge_port, &stopping)?;
+    wait_for_bridge(
+        config.bridge_port,
+        &stopping,
+        resources.helpers.last_mut().unwrap(),
+    )?;
     let selected_backend = std::fs::read_to_string(&backend_status).unwrap_or_default();
     let _ = std::fs::remove_file(&backend_status);
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() && selected_backend.trim() != "portal" {
+    if on_wayland && selected_backend.trim() != "portal" {
         resources
             .helpers
             .push(ManagedChild::spawn_internal("__capture", &log)?);
+    }
+    if on_wayland {
+        println!(
+            "{}",
+            if config.capture_backend == "wayland" {
+                t!("session.waiting_direct_capture").to_string()
+            } else {
+                t!("session.waiting_capture").to_string()
+            }
+        );
+        wait_for_capture(&frames, &stopping, &mut resources)?;
     }
 
     // The service enumerates processes for a winlogon session token source
@@ -527,12 +579,18 @@ pub fn start() -> Result<()> {
             .args(["sc", "start", "GameViewerService"])
             .status();
     }
-    for _ in 0..150 {
-        if service_running(&prefix) {
-            break;
+    let service_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !service_running(&prefix) {
+        resources.check_required_helpers()?;
+        if stopping.load(Ordering::Relaxed) {
+            anyhow::bail!("session startup cancelled");
+        }
+        if std::time::Instant::now() >= service_deadline {
+            anyhow::bail!("{}", t!("session.service_failed"));
         }
         thread::sleep(std::time::Duration::from_millis(200));
     }
+    println!("{}", t!("session.server_running"));
 
     println!("{}", t!("session.launching_client"));
     let ui = install_dir.join("GameViewer.exe");
@@ -559,6 +617,7 @@ pub fn start() -> Result<()> {
     let mut missing_checks = 0u8;
     let mut relaunches = 0;
     while !stopping.load(Ordering::Relaxed) {
+        resources.check_required_helpers()?;
         let running = wine_client_process_exists(&prefix);
         if running {
             seen_client = true;
@@ -652,7 +711,7 @@ fn service_running(prefix: &Path) -> bool {
             .env("WINEPREFIX", prefix)
             .env("WINEDEBUG", wine_debug())
             .args(["sc", "query", "GameViewerService"]),
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(3),
     );
     match output {
         Some(text) => text.lines().any(|line| {
@@ -699,6 +758,35 @@ pub fn stop() -> Result<()> {
         let _ = std::fs::remove_file(path);
     }
     println!("{}", t!("bridge.stop_requested"));
+    Ok(())
+}
+
+/// Activate the official client's existing single-instance UI from the
+/// native tray without starting another capture/input supervisor.
+pub(crate) fn show_client() -> Result<()> {
+    let prefix = data_dir()?.join("wine");
+    let install =
+        crate::wine::find_client_dir(&prefix).context("managed client is not installed")?;
+    let Some((pid, start)) = read_session_identity()? else {
+        anyhow::bail!("managed session is not running");
+    };
+    if process_start_time(pid).ok() != Some(start) {
+        anyhow::bail!("managed session is not running");
+    }
+    let mut child = Command::new("wine")
+        .env("WINEPREFIX", prefix)
+        .env("WINEDEBUG", wine_debug())
+        .env("WINEDLLOVERRIDES", "wevtapi=n,wtsapi32=n")
+        .current_dir(&install)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .arg(install.join("GameViewer.exe"))
+        .spawn()
+        .context("showing the managed client")?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
@@ -754,7 +842,7 @@ fn unix_path_to_wine(path: &Path) -> String {
     format!("Z:{}", path.display()).replace('/', "\\")
 }
 
-fn wait_for_bridge(port: u16, stopping: &AtomicBool) -> Result<()> {
+fn wait_for_bridge(port: u16, stopping: &AtomicBool, helper: &mut ManagedChild) -> Result<()> {
     // The first RemoteDesktop portal grant is intentionally interactive.
     // Keep the supervisor alive while the user chooses a monitor instead of
     // treating a two-second consent delay as a bridge failure.
@@ -762,12 +850,34 @@ fn wait_for_bridge(port: u16, stopping: &AtomicBool) -> Result<()> {
         if stopping.load(Ordering::Relaxed) {
             anyhow::bail!("session startup cancelled");
         }
+        helper.ensure_running()?;
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
             return Ok(());
         }
         thread::sleep(std::time::Duration::from_millis(20));
     }
     anyhow::bail!("input bridge did not become ready")
+}
+
+fn wait_for_capture(
+    frames: &Path,
+    stopping: &AtomicBool,
+    resources: &mut SessionResources,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if stopping.load(Ordering::Relaxed) {
+            anyhow::bail!("session startup cancelled");
+        }
+        resources.check_required_helpers()?;
+        if crate::capture::has_frame(frames) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("{}", t!("session.capture_not_ready"));
+        }
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 fn wait_for_runtime_file(path: &Path, stopping: &AtomicBool) -> Result<()> {

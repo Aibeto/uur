@@ -9,10 +9,11 @@ pub fn enable() -> Result<()> {
     std::fs::create_dir_all(parent)?;
     let executable = std::env::current_exe().context("resolving uur executable")?;
     let exec = desktop_exec_argument(&executable.to_string_lossy());
+    let prefix = crate::config::data_dir()?.join("wine");
     std::fs::write(
         &path,
         format!(
-            "[Desktop Entry]\nType=Application\nName=UU Remote\nComment=Start the managed UU Remote session\nExec={exec} run\nIcon=uur\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+            "[Desktop Entry]\nType=Application\nName=UU Remote\nComment=Start the managed UU Remote session\nExec={exec} run\nIcon=uur\nTerminal=false\nX-GNOME-Autostart-enabled=true\nX-UUR-Managed=true\nX-UUR-Prefix={}\n", prefix.display()
         ),
     )?;
     println!(

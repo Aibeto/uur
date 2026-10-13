@@ -5,7 +5,7 @@ pkgdesc="Native Linux companion for NetEase UU Remote"
 arch=('x86_64')
 url="https://github.com/panxuc/uur"
 license=('MIT')
-depends=('glibc' 'gcc-libs' 'glib2' 'wine' 'curl' 'pipewire' 'xdg-desktop-portal')
+depends=('glibc' 'gcc-libs' 'glib2' 'wine' 'curl' 'pipewire' 'wayland' 'xdg-desktop-portal')
 optdepends=(
     'xdg-desktop-portal-gnome: GNOME-compatible Wayland capture and input'
     'xdg-desktop-portal-kde: Plasma Wayland capture and input'

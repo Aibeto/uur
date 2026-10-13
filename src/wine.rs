@@ -6,11 +6,20 @@ use crate::config::Config;
 
 const OFFICIAL_DOWNLOAD_URL: &str = "https://api.nrd.nie.163.com/api/v1/release/dl/1?channel=gwqd";
 const EULA_URL: &str = "https://uuyc.163.com/contact/20240402/40294_1146065.html";
+const SETUP_DLL_OVERRIDES: &str = "wevtapi=b,wtsapi32=b";
+
+struct SetupPrefix(PathBuf);
+
+impl Drop for SetupPrefix {
+    fn drop(&mut self) {
+        stop_wineserver(&self.0);
+    }
+}
 
 /// One-time provisioning.  Deliberately quiet: progress on stdout, nothing
 /// else.  NetEase binaries are never redistributed — they are fetched from
 /// the official feed into a per-user prefix.
-pub fn setup(accept_eula: bool) -> Result<()> {
+pub fn setup(accept_eula: bool, repair: bool) -> Result<()> {
     let mut config = Config::load()?;
 
     if !config.eula_accepted {
@@ -23,19 +32,40 @@ pub fn setup(accept_eula: bool) -> Result<()> {
         println!("{}", t!("setup.eula_recorded"));
     }
 
+    let _session_lock = crate::session::acquire_session_lock()?;
     let data = crate::config::data_dir()?;
     let prefix = data.join("wine");
     std::fs::create_dir_all(&prefix).context("creating wine prefix directory")?;
 
     let cache = data.join("cache");
     std::fs::create_dir_all(&cache).context("creating cache directory")?;
+    let _prefix_cleanup = SetupPrefix(prefix.clone());
 
-    if find_client_dir(&prefix).is_some() {
-        apply_registry_compat(&prefix)?;
-        let uur_bin = std::env::current_exe().unwrap_or_default();
-        let _ = adopt_shortcut(&prefix, &uur_bin);
+    if !repair
+        && prefix_initialized(&prefix)
+        && find_client_dir(&prefix).is_some()
+        && client_service_registered(&prefix)
+    {
+        finish_setup(&prefix)?;
         println!("{}", t!("setup.already_provisioned"));
-        stop_wineserver(&prefix);
+        return Ok(());
+    }
+
+    println!("{}", t!("setup.initializing_prefix"));
+    let status = Command::new("wineboot")
+        .env("WINEPREFIX", &prefix)
+        .env("WINEDEBUG", wine_debug())
+        .env("WINEDLLOVERRIDES", SETUP_DLL_OVERRIDES)
+        .arg(if repair { "--update" } else { "--init" })
+        .status()
+        .context("running wineboot")?;
+    if !status.success() || !prefix_initialized(&prefix) {
+        anyhow::bail!("{}", t!("setup.prefix_failed", status = status));
+    }
+
+    if find_client_dir(&prefix).is_some() && query_client_service(&prefix)? {
+        finish_setup(&prefix)?;
+        println!("{}", t!("setup.repaired", path = prefix.display()));
         return Ok(());
     }
 
@@ -57,80 +87,94 @@ pub fn setup(accept_eula: bool) -> Result<()> {
         anyhow::bail!("{}", t!("setup.download_failed"));
     }
 
-    println!("{}", t!("setup.initializing_prefix"));
-    let _ = Command::new("wineboot")
-        .env("WINEPREFIX", &prefix)
-        .env("WINEDEBUG", wine_debug())
-        .arg("--init")
-        .status()
-        .context("running wineboot")?;
-
-    // The preload chain only works if Wine resolves wevtapi to the native
-    // shim in the application directory instead of its builtin.
-    let _ = Command::new("wine")
-        .env("WINEPREFIX", &prefix)
-        .env("WINEDEBUG", wine_debug())
-        .args([
-            "reg",
-            "add",
-            r"HKCU\Software\Wine\DllOverrides",
-            "/v",
-            "wevtapi",
-            "/t",
-            "REG_SZ",
-            "/d",
-            "native",
-            "/f",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("registering wevtapi dll override")?;
-
     println!("{}", t!("setup.installing_client"));
     let status = Command::new("wine")
         .env("WINEPREFIX", &prefix)
         .env("WINEDEBUG", wine_debug())
+        .env("WINEDLLOVERRIDES", SETUP_DLL_OVERRIDES)
         .arg(installer.to_string_lossy().as_ref())
         .arg("/S")
         .status()
         .context("launching installer")?;
     if !status.success() {
-        println!("{}", t!("setup.silent_install_unavailable"));
+        anyhow::bail!("{}", t!("setup.install_failed", status = status));
     }
 
+    find_client_dir(&prefix).context(t!("setup.client_incomplete").to_string())?;
+    if !query_client_service(&prefix)? {
+        anyhow::bail!("{}", t!("setup.service_incomplete"));
+    }
+
+    finish_setup(&prefix)?;
+    println!("{}", t!("setup.done", path = prefix.display().to_string()));
+    Ok(())
+}
+
+fn finish_setup(prefix: &Path) -> Result<()> {
     // winemenubuilder generated its entries during the install: adopt the
     // start-menu one for the full session, then stop it from producing raw
     // shortcuts ever again, and sweep desktop copies.
-    let _ = Command::new("wine")
-        .env("WINEPREFIX", &prefix)
-        .env("WINEDEBUG", wine_debug())
-        .args([
-            "reg",
-            "add",
-            r"HKCU\Software\Wine\DllOverrides",
-            "/v",
-            "winemenubuilder",
-            "/t",
-            "REG_SZ",
-            "/d",
-            "",
-            "/f",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("disabling winemenubuilder")?;
-    apply_registry_compat(&prefix)?;
+    set_dll_override(prefix, "wevtapi", "native")?;
+    set_dll_override(prefix, "winemenubuilder", "")?;
+    apply_registry_compat(prefix)?;
     let uur_bin = std::env::current_exe().unwrap_or_default();
-    let _ = adopt_shortcut(&prefix, &uur_bin);
+    let _ = adopt_shortcut(prefix, &uur_bin);
     purge_wine_shortcuts();
 
-    println!("{}", t!("setup.done", path = prefix.display().to_string()));
-    stop_wineserver(&prefix);
     Ok(())
+}
+
+pub fn prefix_initialized(prefix: &Path) -> bool {
+    ["system.reg", "user.reg"]
+        .iter()
+        .all(|name| std::fs::metadata(prefix.join(name)).is_ok_and(|metadata| metadata.len() > 0))
+}
+
+pub fn webview2_installed(prefix: &Path) -> bool {
+    let application = prefix.join("drive_c/Program Files (x86)/Microsoft/EdgeWebView/Application");
+    find_dir_recursive(&application, "msedgewebview2.exe", 3)
+        .is_some_and(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0))
+}
+
+/// Read the persisted Wine service registration without starting Wine or
+/// showing component installers from `uur doctor`.
+pub fn client_service_registered(prefix: &Path) -> bool {
+    let Ok(registry) = std::fs::read_to_string(prefix.join("system.reg")) else {
+        return false;
+    };
+    let mut service_section = false;
+    for line in registry.lines() {
+        if let Some(section) = line.strip_prefix('[').and_then(|line| line.split_once(']')) {
+            service_section = section
+                .0
+                .to_ascii_lowercase()
+                .ends_with(r"\\services\\gameviewerservice");
+        } else if service_section && line.starts_with("\"ImagePath\"=") {
+            return line.to_ascii_lowercase().contains("gameviewerserver.exe");
+        }
+    }
+    false
+}
+
+fn query_client_service(prefix: &Path) -> Result<bool> {
+    let output = Command::new("wine")
+        .env("WINEPREFIX", prefix)
+        .env("WINEDEBUG", wine_debug())
+        .env("WINEDLLOVERRIDES", SETUP_DLL_OVERRIDES)
+        .args([
+            "reg",
+            "query",
+            r"HKLM\System\CurrentControlSet\Services\GameViewerService",
+            "/v",
+            "ImagePath",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .context("checking the UU Windows service registration")?;
+    Ok(output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .to_ascii_lowercase()
+            .contains("gameviewerserver.exe"))
 }
 
 /// Registry compatibility profile, ported from the field-tested reference
@@ -196,7 +240,7 @@ pub fn apply_registry_compat(prefix: &Path) -> Result<()> {
             format!("HKCU\\{key}")
         };
         for (value, reg_type, data) in &values {
-            let _ = Command::new("wine")
+            let status = Command::new("wine")
                 .env("WINEPREFIX", prefix)
                 .env("WINEDEBUG", wine_debug())
                 .args([
@@ -207,6 +251,9 @@ pub fn apply_registry_compat(prefix: &Path) -> Result<()> {
                 .stderr(Stdio::null())
                 .status()
                 .with_context(|| format!("reg add {full} /v {value}"))?;
+            if !status.success() {
+                anyhow::bail!("Wine rejected registry compatibility setting {full} /v {value}");
+            }
         }
     }
     Ok(())
@@ -294,15 +341,21 @@ pub fn find_client_dir(prefix: &Path) -> Option<PathBuf> {
             let vendor = entry.path();
             if let Some(found) = find_dir_recursive(&vendor, "GameViewerServer.exe", 4) {
                 let bin = found.parent()?;
-                if bin
+                let candidate = if bin
                     .file_name()
                     .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
                 {
-                    return bin.parent().map(Path::to_path_buf);
+                    bin.parent()?.to_path_buf()
+                } else {
+                    bin.to_path_buf()
+                };
+                if std::fs::metadata(candidate.join("GameViewer.exe"))
+                    .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+                    && std::fs::metadata(&found).is_ok_and(|metadata| metadata.len() > 0)
+                {
+                    return Some(candidate);
                 }
-                return Some(bin.to_path_buf());
             }
-            return Some(vendor);
         }
     }
     None
@@ -315,7 +368,11 @@ fn find_dir_recursive(start: &Path, needle: &str, depth: u8) -> Option<PathBuf> 
     let entries = std::fs::read_dir(start).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() && path.file_name().map(|n| n == needle).unwrap_or(false) {
+        if path.is_file()
+            && path
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case(needle))
+        {
             return Some(path);
         }
         if path.is_dir() {
@@ -357,8 +414,11 @@ pub fn adopt_shortcut(prefix: &Path, uur_bin: &Path) -> Result<()> {
     };
 
     let mut icon_name = String::new();
-    let home = std::env::var("HOME").unwrap_or_default();
-    let icons = PathBuf::from(home).join(".local/share/icons");
+    let data_home = crate::config::data_dir()?
+        .parent()
+        .context("no data home")?
+        .to_path_buf();
+    let icons = data_home.join("icons");
     let mut best = 0u32;
     if let Ok(sizes) = fs::read_dir(icons.join("hicolor")) {
         for size in sizes.flatten() {
@@ -382,9 +442,7 @@ pub fn adopt_shortcut(prefix: &Path, uur_bin: &Path) -> Result<()> {
         }
     }
 
-    let applications = std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".local/share/applications"))
-        .context("no home")?;
+    let applications = data_home.join("applications");
     std::fs::create_dir_all(&applications)?;
     let entry = applications.join(format!("{name}.desktop"));
     let exec = uur_bin.display();
@@ -405,7 +463,9 @@ pub fn adopt_shortcut(prefix: &Path, uur_bin: &Path) -> Result<()> {
              {icon_line}Terminal=false\n\
              NoDisplay=true\n\
              X-UUR-Managed=true\n\
-             Categories=Network;RemoteAccess;\n"
+             X-UUR-Prefix={}\n\
+             Categories=Network;RemoteAccess;\n",
+            prefix.display()
         ),
     )
     .with_context(|| format!("writing {}", entry.display()))?;

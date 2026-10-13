@@ -130,13 +130,16 @@ fn portal_capabilities() -> (bool, bool, String) {
     runtime.block_on(async {
         let (capture, sources) = match ashpd::desktop::screencast::Screencast::new().await {
             Ok(portal) => match portal.available_source_types().await {
-                Ok(types) => (true, format!("{types:?}")),
+                Ok(types) => (!types.is_empty(), format!("{types:?}")),
                 Err(_) => (false, "unavailable".into()),
             },
             Err(_) => (false, "unavailable".into()),
         };
         let input = match ashpd::desktop::remote_desktop::RemoteDesktop::new().await {
-            Ok(portal) => portal.available_device_types().await.is_ok(),
+            Ok(portal) => portal.available_device_types().await.is_ok_and(|types| {
+                types.contains(ashpd::desktop::remote_desktop::DeviceType::Keyboard)
+                    && types.contains(ashpd::desktop::remote_desktop::DeviceType::Pointer)
+            }),
             Err(_) => false,
         };
         (capture, input, sources)
@@ -176,6 +179,32 @@ pub fn report() -> Result<()> {
     };
     line(ok(missing_wine), "wine", &wine_detail);
 
+    let prefix = crate::config::data_dir()?.join("wine");
+    line(
+        ok(!crate::wine::prefix_initialized(&prefix)),
+        "managed Wine prefix",
+        &prefix.display().to_string(),
+    );
+    let client = crate::wine::find_client_dir(&prefix);
+    let client_detail = client
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| t!("doctor.client_incomplete").to_string());
+    line(ok(client.is_none()), "UU client and server", &client_detail);
+    let service = crate::wine::client_service_registered(&prefix);
+    let service_detail = if service {
+        t!("doctor.service_registered").to_string()
+    } else {
+        t!("doctor.service_missing").to_string()
+    };
+    line(ok(!service), "GameViewerService", &service_detail);
+    let webview_detail = if crate::wine::webview2_installed(&prefix) {
+        t!("doctor.present").to_string()
+    } else {
+        t!("doctor.webview_pending").to_string()
+    };
+    line("info", "WebView2 runtime", &webview_detail);
+
     let backends = portal_backends();
     let has_portal_impl = !backends.is_empty();
     let portal_detail = if backends.is_empty() {
@@ -187,7 +216,7 @@ pub fn report() -> Result<()> {
 
     let (portal_capture, portal_input, portal_sources) = portal_capabilities();
     let portal_capture_detail = if portal_capture {
-        t!("doctor.present").to_string()
+        t!("doctor.portal_capture_advertised").to_string()
     } else {
         t!("doctor.portal_capture_missing").to_string()
     };
@@ -198,7 +227,7 @@ pub fn report() -> Result<()> {
     );
     line("info", "portal source types", &portal_sources);
     let portal_input_detail = if portal_input {
-        t!("doctor.present").to_string()
+        t!("doctor.portal_input_advertised").to_string()
     } else {
         t!("doctor.portal_input_missing").to_string()
     };
@@ -313,19 +342,62 @@ pub fn report() -> Result<()> {
     let uinput_missing = uinput_detail != t!("doctor.present");
     line(ok(uinput_missing), "uinput (/dev/uinput)", &uinput_detail);
 
-    // Mirror the real auto policy in input::select.
+    // Report the configured policy; portal properties do not validate that
+    // the compositor can successfully create an authorized session.
     let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
-    let (backend, backend_note) = if session_type == "wayland" && portal_input {
-        ("portal", t!("doctor.backend_portal").to_string())
-    } else if session_type == "wayland" && !uinput_missing {
-        ("uinput", t!("doctor.backend_wayland").to_string())
-    } else if std::env::var("DISPLAY").is_ok() {
-        ("xtest", t!("doctor.backend_x11").to_string())
-    } else {
-        ("none", t!("doctor.backend_none").to_string())
-    };
+    let on_wayland = session_type == "wayland" || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let configured = crate::config::Config::load()?;
     line(
         "info",
+        "capture backend",
+        &format!(
+            "{} ({})",
+            configured.capture_backend,
+            configured
+                .capture_output
+                .as_deref()
+                .unwrap_or("selected/default output")
+        ),
+    );
+    let mut preferred = std::env::var("UUR_INPUT_BACKEND").unwrap_or(configured.input_backend);
+    if configured.capture_backend == "wayland" && preferred == "auto" {
+        preferred = "uinput".into();
+    }
+    let (status, backend, backend_note) = match preferred.as_str() {
+        "portal" => (
+            ok(!portal_input),
+            "portal",
+            t!("doctor.backend_portal").to_string(),
+        ),
+        "uinput" => (
+            ok(uinput_missing),
+            "uinput",
+            t!("doctor.backend_wayland").to_string(),
+        ),
+        "xtest" if on_wayland => ("WARN", "xtest", t!("doctor.backend_partial").to_string()),
+        "xtest" => (
+            ok(std::env::var_os("DISPLAY").is_none()),
+            "xtest",
+            t!("doctor.backend_x11").to_string(),
+        ),
+        "auto" if on_wayland && portal_input => {
+            ("info", "portal", t!("doctor.backend_portal").to_string())
+        }
+        "auto" if on_wayland && !uinput_missing => {
+            ("info", "uinput", t!("doctor.backend_wayland").to_string())
+        }
+        "auto" if on_wayland => (
+            "MISS",
+            "none",
+            t!("doctor.backend_wayland_missing").to_string(),
+        ),
+        "auto" if std::env::var_os("DISPLAY").is_some() => {
+            ("info", "xtest", t!("doctor.backend_x11").to_string())
+        }
+        _ => ("MISS", "none", t!("doctor.backend_none").to_string()),
+    };
+    line(
+        status,
         "input backend",
         &format!("{backend} ({backend_note})"),
     );

@@ -125,7 +125,7 @@ cargo build --release --locked
 ./scripts/install-user.sh
 ```
 
-源码构建需要 Rust、C 编译器、PipeWire 开发文件、`pkg-config` 和 MinGW-w64 x86_64
+源码构建需要 Rust、C 编译器、PipeWire 与 Wayland 开发文件（含 `wayland-scanner`）、`pkg-config` 和 MinGW-w64 x86_64
 工具链。
 
 Gentoo、Void Linux、Slackware、Solus、ALT Linux、Exherbo、Clear Linux、Mageia、
@@ -146,11 +146,22 @@ uur autostart disable   # 删除受管登录自启动项
 uur wol status          # 检查物理有线网卡的 WOL 状态
 uur display status      # 查看显示器、窗口或 Portal 虚拟源设置
 uur display source virtual
+uur display outputs     # 查看原生 Wayland 显示器名称
 uur stop                # 只停止 uur 助手与专用 Wine 前缀
+uur uninstall --purge --dry-run  # 预览完整用户数据清理范围
+uur uninstall --purge   # 确认清理后，再用包管理器卸载系统包
 ```
 
 从桌面启动 UU 后，可在启动器的应用操作菜单中选择“退出”；从终端运行时可执行
 `uur stop` 或按 Ctrl+C。
+
+niri 可使用原生托盘，并明确启用直接采集：先运行 `uur display outputs` 查看名称，再运行
+`uur display backend wayland --output DP-1`（替换为自己的名称）。此模式使用 uinput，
+直接采集指定显示器，不弹出 Portal 授权框；`uur display backend portal` 可恢复系统授权采集。
+
+仅用包管理器卸载会保留 Wine 环境和账号数据。完整卸载请先以当前用户身份运行
+`uur uninstall --purge`，再执行 `sudo pacman -Rns uur`（Arch）；其他发行版使用
+对应的包管理器。详见[完整卸载说明](docs/distribution.md#package-removal-repair-and-per-user-state)。
 
 输入后端排错：
 

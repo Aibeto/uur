@@ -2,5 +2,6 @@
 /build
 /dist
 /capture/uur-pw-capture
+/capture/uur-wl-capture
 Cargo.lock.orig
 *.tar.gz
