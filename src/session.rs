@@ -181,7 +181,7 @@ fn deploy_terminal_proxy(install_dir: &Path) -> Result<PathBuf> {
     let source_dir = hook_source_dir()?;
     let source = source_dir.join("uur-terminal-proxy.exe");
     let mux_source = source_dir.join("uur-mux-proxy.exe");
-    let bin = install_dir.join("bin");
+    let bin = crate::wine::client_payload_dir(install_dir);
     std::fs::create_dir_all(&bin)?;
     for status in ["uur-terminal-adapter.status", "uur-mux-adapter.status"] {
         let _ = std::fs::remove_file(bin.join(status));
@@ -254,9 +254,8 @@ fn ensure_webview2(prefix: &Path, install_dir: &Path) -> Result<()> {
     if crate::wine::webview2_installed(prefix) {
         return Ok(());
     }
-    let bootstrapper = install_dir
-        .join("bin")
-        .join("MicrosoftEdgeWebview2Setup.exe");
+    let bootstrapper =
+        crate::wine::client_payload_dir(install_dir).join("MicrosoftEdgeWebview2Setup.exe");
     if !bootstrapper.is_file() {
         anyhow::bail!("{}", t!("session.webview_missing"));
     }

@@ -395,33 +395,100 @@ fn flush_prefix(prefix: &Path) -> Result<()> {
 
 /// Locate the installed client directory regardless of how NetEase spells
 /// the vendor folder ("Netease", "NetEase", ...).  Case matters on Linux.
+///
+/// NetEase ships the payload both as `<root>/bin/` and as a sibling
+/// `<root>/<version>/` directory.  The version directory is *not* the
+/// application root: uur reaches the client through `<root>/bin/...` for the
+/// terminal proxies and the WebView2 bootstrapper.  The old search returned
+/// the first `GameViewerServer.exe` it happened to reach, so when readdir
+/// order put `<root>/<version>/` first it returned that instead, every
+/// `join("bin")` lookup missed, and `uur run` aborted with a missing WebView2
+/// bootstrapper.
+///
+/// Rank every directory that holds the launcher and pick the best-scoring,
+/// shallowest one, so the choice no longer depends on readdir order.
 pub fn find_client_dir(prefix: &Path) -> Option<PathBuf> {
     let program_files = prefix.join("drive_c").join("Program Files");
     let entries = std::fs::read_dir(&program_files).ok()?;
+    let mut roots = Vec::new();
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        if name.to_string_lossy().eq_ignore_ascii_case("netease") {
-            let vendor = entry.path();
-            if let Some(found) = find_dir_recursive(&vendor, "GameViewerServer.exe", 4) {
-                let bin = found.parent()?;
-                let candidate = if bin
-                    .file_name()
-                    .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
-                {
-                    bin.parent()?.to_path_buf()
-                } else {
-                    bin.to_path_buf()
-                };
-                if std::fs::metadata(candidate.join("GameViewer.exe"))
-                    .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
-                    && std::fs::metadata(&found).is_ok_and(|metadata| metadata.len() > 0)
-                {
-                    return Some(candidate);
-                }
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("netease")
+        {
+            continue;
+        }
+        collect_client_roots(&entry.path(), 4, &mut roots);
+    }
+    roots.retain(|root| client_root_rank(root) > 0);
+    roots.sort_by(|left, right| {
+        client_root_rank(right)
+            .cmp(&client_root_rank(left))
+            .then_with(|| left.components().count().cmp(&right.components().count()))
+            .then_with(|| left.cmp(right))
+    });
+    roots.dedup();
+    roots.into_iter().next()
+}
+
+/// Installed releases normally place their payload in bin/. A complete flat
+/// version directory remains usable when it is the only installation present.
+pub fn client_payload_dir(client: &Path) -> PathBuf {
+    let bin = client.join("bin");
+    if non_empty_file(&bin.join("GameViewerServer.exe")) {
+        bin
+    } else {
+        client.to_path_buf()
+    }
+}
+
+/// Collect every directory that contains the client launcher.
+fn collect_client_roots(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_client_roots(&path, depth - 1, out);
+        } else if path
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("GameViewer.exe"))
+            && non_empty_file(&path)
+        {
+            if let Some(parent) = path.parent() {
+                out.push(parent.to_path_buf());
             }
         }
     }
-    None
+}
+
+/// Score a candidate root by how well it matches the layout uur drives.
+///
+/// `bin/GameViewerServer.exe` is the strong signal: the terminal proxies and
+/// the WebView2 bootstrapper are all reached through `<root>/bin/`, so a
+/// candidate whose `bin` holds the server is the real root, while the
+/// `<root>/<version>/` payload copy only holds the launcher at its top level.
+fn client_root_rank(candidate: &Path) -> u8 {
+    let bin = candidate.join("bin");
+    if non_empty_file(&bin.join("GameViewerServer.exe")) {
+        4 + u8::from(non_empty_file(&bin.join("MicrosoftEdgeWebview2Setup.exe")))
+    } else if non_empty_file(&candidate.join("GameViewerServer.exe")) {
+        2 + u8::from(non_empty_file(
+            &candidate.join("MicrosoftEdgeWebview2Setup.exe"),
+        ))
+    } else {
+        // A launcher alone can be left behind by an interrupted installer.
+        0
+    }
+}
+
+fn non_empty_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
 }
 
 fn find_dir_recursive(start: &Path, needle: &str, depth: u8) -> Option<PathBuf> {
@@ -578,10 +645,140 @@ fn purge_wine_shortcuts() {
 
 #[cfg(test)]
 mod tests {
+    use super::find_client_dir;
     use super::log_pixels_command;
     use super::registry_compat_entries;
     use super::service_image_path;
     use std::path::Path;
+    use std::path::PathBuf;
+
+    /// Scratch prefix with a real NetEase directory layout, removed on drop.
+    struct TestPrefix(PathBuf);
+
+    impl TestPrefix {
+        fn create() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "uur-client-dir-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        /// Create `<prefix>/drive_c/Program Files/Netease/GameViewer/<rel>`.
+        fn write_client_file(&self, rel: &str, contents: &[u8]) {
+            let path = self
+                .0
+                .join("drive_c/Program Files/Netease/GameViewer")
+                .join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+    }
+
+    impl Drop for TestPrefix {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Populate both payload copies NetEase installs.  The buggy search
+    /// returned `<version>/` whenever readdir reached it first, which then
+    /// failed every `join("bin")` lookup.
+    fn install_both_layouts(prefix: &TestPrefix) {
+        for relative in [
+            "GameViewer.exe",
+            "GameViewerServer.exe",
+            "bin/GameViewer.exe",
+            "bin/GameViewerServer.exe",
+            "4.42.0.2770/GameViewer.exe",
+            "4.42.0.2770/GameViewerServer.exe",
+        ] {
+            prefix.write_client_file(relative, b"payload");
+        }
+    }
+
+    #[test]
+    fn client_root_is_the_directory_holding_bin_not_the_version_directory() {
+        let prefix = TestPrefix::create();
+        install_both_layouts(&prefix);
+
+        let root = find_client_dir(prefix.path()).expect("client root");
+
+        assert!(
+            root.join("bin").join("GameViewerServer.exe").is_file(),
+            "the returned root must contain bin/GameViewerServer.exe, got {}",
+            root.display()
+        );
+        assert!(
+            !root.file_name().is_some_and(|name| name == "4.42.0.2770"),
+            "the version directory must not be selected, got {}",
+            root.display()
+        );
+    }
+
+    #[test]
+    fn client_root_is_stable_regardless_of_readdir_order() {
+        let prefix = TestPrefix::create();
+        install_both_layouts(&prefix);
+        let expected = find_client_dir(prefix.path()).unwrap();
+        // Repeated lookups must not alternate between the two payload copies.
+        for _ in 0..16 {
+            assert_eq!(find_client_dir(prefix.path()).as_ref(), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn bin_layout_outranks_a_versioned_payload_copy() {
+        let prefix = TestPrefix::create();
+        // The versioned copy has the launcher and server at its top level,
+        // but no bin/; the real root has the payload in bin/.
+        prefix.write_client_file("GameViewer.exe", b"payload");
+        prefix.write_client_file("4.42.0.2770/GameViewer.exe", b"payload");
+        prefix.write_client_file("4.42.0.2770/GameViewerServer.exe", b"payload");
+        prefix.write_client_file("bin/GameViewerServer.exe", b"payload");
+
+        let root = find_client_dir(prefix.path()).expect("client root");
+
+        assert!(
+            root.join("bin").join("GameViewerServer.exe").is_file(),
+            "the bin layout must win, got {}",
+            root.display()
+        );
+        assert!(
+            !root.file_name().is_some_and(|name| name == "4.42.0.2770"),
+            "the version directory must not win, got {}",
+            root.display()
+        );
+    }
+
+    #[test]
+    fn versioned_copy_is_used_only_when_it_is_the_only_candidate() {
+        let prefix = TestPrefix::create();
+        prefix.write_client_file("4.42.0.2770/GameViewer.exe", b"payload");
+        prefix.write_client_file("4.42.0.2770/GameViewerServer.exe", b"payload");
+
+        let root = find_client_dir(prefix.path()).expect("client root");
+
+        assert!(root.ends_with("4.42.0.2770"), "got {}", root.display());
+        assert_eq!(super::client_payload_dir(&root), root);
+    }
+
+    #[test]
+    fn missing_client_reports_none() {
+        let prefix = TestPrefix::create();
+        std::fs::create_dir_all(prefix.path().join("drive_c/Program Files/Netease")).unwrap();
+        assert!(find_client_dir(prefix.path()).is_none());
+        prefix.write_client_file("GameViewer.exe", b"payload");
+        prefix.write_client_file("bin/MicrosoftEdgeWebview2Setup.exe", b"payload");
+        assert!(find_client_dir(prefix.path()).is_none());
+    }
 
     /// Real `system.reg` excerpt written by the NetEase installer, escaped
     /// exactly as Wine stores it.  The service ImagePath names
