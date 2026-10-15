@@ -60,15 +60,10 @@ pub fn setup(accept_eula: bool, repair: bool) -> Result<()> {
         .arg(if repair { "--update" } else { "--init" })
         .status()
         .context("running wineboot")?;
-    // `wineboot --init` exits before wineserver flushes system.reg/user.reg
-    // to disk (measured ~7s on Wine 11), so a freshly created prefix looks
-    // uninitialized to the check below even though wineboot succeeded.  Wait
-    // for the server to go idle, which is the point at which the registry
-    // files are actually on disk.
-    flush_prefix(&prefix);
-    if !status.success() || !prefix_initialized(&prefix) {
+    if !status.success() {
         anyhow::bail!("{}", t!("setup.prefix_failed", status = status));
     }
+    flush_prefix(&prefix).context("waiting for Wine to persist the initialized prefix")?;
 
     if find_client_dir(&prefix).is_some() && query_client_service(&prefix)? {
         finish_setup(&prefix)?;
@@ -355,40 +350,47 @@ fn stop_wineserver(prefix: &Path) {
         .status();
 }
 
-/// Block until wineserver has flushed the prefix registry to disk.
-///
-/// `wineboot` returns as soon as it has handed work to wineserver, but
-/// `system.reg`/`user.reg` only appear once the server shuts down.  Without
-/// this barrier a freshly provisioned prefix is misread as broken.  Both waits
-/// are bounded so a stray Wine process cannot hang provisioning.
-fn flush_prefix(prefix: &Path) {
-    if let Ok(mut child) = Command::new("wineserver")
+/// Wait for a new prefix's registry files without waiting for running services
+/// to exit. Existing prefixes can be queried through Wine immediately.
+fn flush_prefix(prefix: &Path) -> Result<()> {
+    if prefix_initialized(prefix) {
+        return Ok(());
+    }
+    let mut child = Command::new("wineserver")
         .env("WINEPREFIX", prefix)
         .arg("-w")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-    {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
-                }
-            }
-        }
-    }
+        .context("starting wineserver registry wait")?;
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !prefix_initialized(prefix) && Instant::now() < deadline {
+    let result = loop {
+        if prefix_initialized(prefix) {
+            break Ok(());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if !status.success() => {
+                break Err(anyhow::anyhow!(
+                    "wineserver registry wait failed ({status})"
+                ));
+            }
+            Err(error) => break Err(error).context("checking wineserver registry wait"),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            break Err(anyhow::anyhow!(
+                "Wine did not create non-empty system.reg and user.reg within 30 seconds"
+            ));
+        }
         std::thread::sleep(Duration::from_millis(100));
+    };
+    // This is only the `-w` waiter, not the prefix's server or its processes.
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
+    result
 }
 
 /// Locate the installed client directory regardless of how NetEase spells
