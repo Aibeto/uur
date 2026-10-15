@@ -347,6 +347,7 @@ fn stop_wineserver(prefix: &Path) {
 pub fn find_client_dir(prefix: &Path) -> Option<PathBuf> {
     let program_files = prefix.join("drive_c").join("Program Files");
     let entries = std::fs::read_dir(&program_files).ok()?;
+    let mut roots = Vec::new();
     for entry in entries.flatten() {
         if !entry
             .file_name()
@@ -355,20 +356,28 @@ pub fn find_client_dir(prefix: &Path) -> Option<PathBuf> {
         {
             continue;
         }
-        let mut roots = Vec::new();
         collect_client_roots(&entry.path(), 4, &mut roots);
-        roots.sort_by(|left, right| {
-            client_root_rank(right)
-                .cmp(&client_root_rank(left))
-                .then_with(|| left.components().count().cmp(&right.components().count()))
-                .then_with(|| left.cmp(right))
-        });
-        roots.dedup();
-        if let Some(best) = roots.into_iter().next() {
-            return Some(best);
-        }
     }
-    None
+    roots.retain(|root| client_root_rank(root) > 0);
+    roots.sort_by(|left, right| {
+        client_root_rank(right)
+            .cmp(&client_root_rank(left))
+            .then_with(|| left.components().count().cmp(&right.components().count()))
+            .then_with(|| left.cmp(right))
+    });
+    roots.dedup();
+    roots.into_iter().next()
+}
+
+/// Installed releases normally place their payload in bin/. A complete flat
+/// version directory remains usable when it is the only installation present.
+pub fn client_payload_dir(client: &Path) -> PathBuf {
+    let bin = client.join("bin");
+    if non_empty_file(&bin.join("GameViewerServer.exe")) {
+        bin
+    } else {
+        client.to_path_buf()
+    }
 }
 
 /// Collect every directory that contains the client launcher.
@@ -403,17 +412,16 @@ fn collect_client_roots(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
 /// `<root>/<version>/` payload copy only holds the launcher at its top level.
 fn client_root_rank(candidate: &Path) -> u8 {
     let bin = candidate.join("bin");
-    let mut rank = 0;
     if non_empty_file(&bin.join("GameViewerServer.exe")) {
-        rank += 2;
+        4 + u8::from(non_empty_file(&bin.join("MicrosoftEdgeWebview2Setup.exe")))
+    } else if non_empty_file(&candidate.join("GameViewerServer.exe")) {
+        2 + u8::from(non_empty_file(
+            &candidate.join("MicrosoftEdgeWebview2Setup.exe"),
+        ))
+    } else {
+        // A launcher alone can be left behind by an interrupted installer.
+        0
     }
-    if non_empty_file(&bin.join("MicrosoftEdgeWebview2Setup.exe")) {
-        rank += 1;
-    }
-    if non_empty_file(&candidate.join("GameViewerServer.exe")) {
-        rank += 1;
-    }
-    rank
 }
 
 fn non_empty_file(path: &Path) -> bool {
@@ -690,16 +698,21 @@ mod tests {
     fn versioned_copy_is_used_only_when_it_is_the_only_candidate() {
         let prefix = TestPrefix::create();
         prefix.write_client_file("4.42.0.2770/GameViewer.exe", b"payload");
+        prefix.write_client_file("4.42.0.2770/GameViewerServer.exe", b"payload");
 
         let root = find_client_dir(prefix.path()).expect("client root");
 
         assert!(root.ends_with("4.42.0.2770"), "got {}", root.display());
+        assert_eq!(super::client_payload_dir(&root), root);
     }
 
     #[test]
     fn missing_client_reports_none() {
         let prefix = TestPrefix::create();
         std::fs::create_dir_all(prefix.path().join("drive_c/Program Files/Netease")).unwrap();
+        assert!(find_client_dir(prefix.path()).is_none());
+        prefix.write_client_file("GameViewer.exe", b"payload");
+        prefix.write_client_file("bin/MicrosoftEdgeWebview2Setup.exe", b"payload");
         assert!(find_client_dir(prefix.path()).is_none());
     }
 
