@@ -242,9 +242,16 @@ pub(crate) async fn preferred_cursor_mode(
         Ok(modes) => modes,
         // ScreenCast v2 introduced the property; older portals have no
         // advertisement to consult, so keep the historical request.
-        Err(_) => return Ok(CursorMode::Embedded),
+        Err(ashpd::Error::RequiresVersion(2, 0..=1)) => return Ok(CursorMode::Embedded),
+        Err(error) => return Err(error).context("reading ScreenCast cursor modes"),
     };
-    choose_cursor_mode(available).ok_or_else(|| anyhow!("{}", t!("capture.cursor_unsupported")))
+    let mode = choose_cursor_mode(available)
+        .ok_or_else(|| anyhow!("{}", t!("capture.cursor_unsupported")))?;
+    if mode != CursorMode::Embedded {
+        // The helper publishes pixels, not PipeWire cursor metadata.
+        eprintln!("{}", t!("capture.cursor_not_embedded"));
+    }
+    Ok(mode)
 }
 
 /// One full portal handshake.  Returns the PipeWire fd, the video node id

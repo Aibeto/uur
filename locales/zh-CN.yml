@@ -73,6 +73,7 @@ capture:
   session_ready: "Portal 会话已建立（视频节点 %{node}）；正在写入私有运行时传输"
   helper_failed: "捕获助手异常退出"
   cursor_unsupported: "桌面 Portal 未声明任何可用的光标模式，无法开始屏幕采集。请重启 Portal（systemctl --user restart xdg-desktop-portal）后重试；若仍失败，请确认已安装与当前会话匹配的 ScreenCast 后端。"
+  cursor_not_embedded: "Portal 无法将光标嵌入画面；采集将继续，但视频帧中不会包含光标"
 
 setup:
   eula_prompt: "官方 UU 远程客户端将从网易官方渠道下载，并受其最终用户协议约束：%{url}\n使用 --accept-eula 重新运行以继续。"

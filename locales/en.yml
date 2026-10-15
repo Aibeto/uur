@@ -57,6 +57,7 @@ capture:
   session_ready: "portal session ready (video node %{node}); streaming to the private runtime transport"
   helper_failed: "the capture helper exited with an error"
   cursor_unsupported: "the desktop portal advertises no usable cursor mode, so screen capture cannot start. Restart the portal (systemctl --user restart xdg-desktop-portal) and retry; if it persists, check that a ScreenCast backend matching your session is installed."
+  cursor_not_embedded: "the portal cannot embed the cursor; capture will continue without a cursor in the video frames"
 
 session:
   already_running: "a session is already running - use it, or run `uur stop` first"
