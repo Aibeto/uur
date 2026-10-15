@@ -75,3 +75,6 @@ subscribes to MonitorsChanged and proactively restores capture after a layout
 change. It coalesces signals during the reconnect delay. Stop requests and an
 already-received Session.Closed signal take priority over layout recovery. This
 optional listener never starts a GNOME service on other desktops.
+Successful layout-driven restarts do not consume the failure retry budget.
+Only the initial session can make a token-less interactive selection; later
+restores keep that boundary even when the failure counter has been reset.

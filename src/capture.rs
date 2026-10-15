@@ -76,15 +76,16 @@ pub fn run() -> Result<()> {
     runtime.block_on(async {
         let frames = frame_path()?;
         let mut failures = 0;
+        let mut initial_session = true;
         let mut display_changes = watch_display_changes().await;
         loop {
             let opened = tokio::select! {
-                result = portal_session(&mut config, failures == 0) => result,
+                result = portal_session(&mut config, initial_session) => result,
                 _ = wait_for_stop(&stopping) => return Ok(()),
             };
             let (pw_fd, node, session) = match opened {
                 Ok(opened) => opened,
-                Err(error) if failures > 0 && failures < 3 => {
+                Err(error) if !initial_session && failures < 3 => {
                     failures += 1;
                     eprintln!("capture reconnect {failures}/3 failed: {error:#}");
                     tokio::select! {
@@ -94,6 +95,7 @@ pub fn run() -> Result<()> {
                 }
                 Err(error) => return Err(error),
             };
+            initial_session = false;
             println!("{}", t!("capture.session_ready", node = node));
             let mut closed = session.receive_closed().await?;
             match std::fs::remove_file(&frames) {
@@ -144,13 +146,15 @@ pub fn run() -> Result<()> {
             if healthy_since.is_some_and(|since| since.elapsed() >= Duration::from_secs(30)) {
                 failures = 0;
             }
-            failures += 1;
-            if failures > 3 {
-                anyhow::bail!("capture recovery failed repeatedly; restart uur run to share again");
-            }
             if reconfigure {
-                eprintln!("display configuration changed; restoring capture {failures}/3");
+                eprintln!("display configuration changed; restoring capture");
             } else {
+                failures += 1;
+                if failures > 3 {
+                    anyhow::bail!(
+                        "capture recovery failed repeatedly; restart uur run to share again"
+                    );
+                }
                 let status = status.context("capture helper stopped without an exit status")?;
                 if !matches!(status.code(), Some(0 | 75) | None) {
                     anyhow::bail!(
