@@ -68,13 +68,17 @@ of healthy capture resets the retry budget. An unchanged desktop in STREAMING
 does not trigger this watchdog. Recovery keeps the saved token and performs no
 token-less fallback or switch to direct capture. The portal controls whether
 restoring that choice requires confirmation. A portal Session.Closed signal
-ends sharing; the user starts a new session explicitly.
+without a matching Mutter layout change ends sharing; the user starts a new
+session explicitly. The supervisor subscribes to the raw signal on the session's
+own connection, accepting both dictionary and empty signal bodies.
 
 When Mutter's DisplayConfig service is already present, the supervisor also
 subscribes to MonitorsChanged and proactively restores capture after a layout
-change. It coalesces signals during the reconnect delay. Stop requests and an
-already-received Session.Closed signal take priority over layout recovery. This
-optional listener never starts a GNOME service on other desktops.
+change. It coalesces signals during the reconnect delay. Mutter may close the
+old session before forwarding MonitorsChanged, so a Closed signal has a 250 ms
+window to correlate that transaction. Closed without a matching change stops
+capture, and process stop requests always take priority. This optional listener
+never starts a GNOME service on other desktops.
 Successful layout-driven restarts do not consume the failure retry budget.
 Only the initial session can make a token-less interactive selection; later
 restores keep that boundary even when the failure counter has been reset.

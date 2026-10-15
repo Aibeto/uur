@@ -28,6 +28,14 @@ use crate::config::Config;
 type PortalSession =
     ashpd::desktop::Session<'static, ashpd::desktop::screencast::Screencast<'static>>;
 
+struct PortalCapture {
+    fd: OwnedFd,
+    node: u32,
+    restore_token: Option<String>,
+    session: PortalSession,
+    closed: zbus::proxy::SignalStream<'static>,
+}
+
 /// Run the capture path until interrupted.
 pub fn run_standalone() -> Result<()> {
     // Public capture uses the same lifecycle lock as run/setup so stop and
@@ -83,7 +91,13 @@ pub fn run() -> Result<()> {
                 result = portal_session(&mut config, initial_session) => result,
                 _ = wait_for_stop(&stopping) => return Ok(()),
             };
-            let (pw_fd, node, session) = match opened {
+            let PortalCapture {
+                fd: pw_fd,
+                node,
+                session,
+                mut closed,
+                ..
+            } = match opened {
                 Ok(opened) => opened,
                 Err(error) if !initial_session && failures < 3 => {
                     failures += 1;
@@ -97,7 +111,6 @@ pub fn run() -> Result<()> {
             };
             initial_session = false;
             println!("{}", t!("capture.session_ready", node = node));
-            let mut closed = session.receive_closed().await?;
             match std::fs::remove_file(&frames) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -112,7 +125,14 @@ pub fn run() -> Result<()> {
                     biased;
                     _ = wait_for_stop(&stopping) => break None,
                     _ = closed.next() => {
-                        portal_closed = true;
+                        // Mutter can close the old stream before forwarding
+                        // MonitorsChanged. Correlate that layout transaction;
+                        // a user Stop without a display change stays closed.
+                        reconfigure = tokio::time::timeout(
+                            Duration::from_millis(250),
+                            next_display_change(&mut display_changes),
+                        ).await.is_ok();
+                        portal_closed = !reconfigure;
                         break None;
                     }
                     _ = next_display_change(&mut display_changes) => {
@@ -136,8 +156,8 @@ pub fn run() -> Result<()> {
             if stopping.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            // Closed may mean the user pressed Stop sharing. Never silently
-            // restore that permission or fall back to direct capture.
+            // Closed without a matching layout change means Stop sharing.
+            // Never silently restore that permission or use direct capture.
             if portal_closed {
                 anyhow::bail!(
                     "screen sharing was closed by the portal; restart uur run to share again"
@@ -307,11 +327,7 @@ fn frame_path() -> Result<PathBuf> {
 /// First attempt reuses the stored restore token; if that fails (stale
 /// token, monitor changed, compositor restart) fall back to one
 /// interactive attempt and store the fresh token.
-#[allow(clippy::type_complexity)]
-async fn portal_session(
-    config: &mut Config,
-    interactive: bool,
-) -> Result<(OwnedFd, u32, PortalSession)> {
+async fn portal_session(config: &mut Config, interactive: bool) -> Result<PortalCapture> {
     let saved_token = config.capture_restore_token.clone();
     let screencast = ashpd::desktop::screencast::Screencast::new()
         .await
@@ -326,12 +342,12 @@ async fn portal_session(
         .chain(interactive.then_some(None))
     {
         match negotiate(&screencast, source, token.as_deref()).await {
-            Ok((fd, node, fresh_token, session)) => {
-                if fresh_token != saved_token {
-                    config.capture_restore_token = fresh_token;
+            Ok(capture) => {
+                if capture.restore_token != saved_token {
+                    config.capture_restore_token = capture.restore_token.clone();
                     config.store().context("storing the new restore token")?;
                 }
-                return Ok((fd, node, session));
+                return Ok(capture);
             }
             Err(error) => {
                 last_error = Some(error);
@@ -397,10 +413,26 @@ async fn negotiate(
     screencast: &ashpd::desktop::screencast::Screencast<'static>,
     source: ashpd::desktop::screencast::SourceType,
     restore_token: Option<&str>,
-) -> Result<(OwnedFd, u32, Option<String>, PortalSession)> {
+) -> Result<PortalCapture> {
     use ashpd::desktop::PersistMode;
 
     let session = screencast.create_session().await?;
+    // Session.Closed carries a{sv}. ashpd 0.10 deserializes it as (), which
+    // silently drops the signal. Subscribe on the SAME connection (the
+    // frontend unicasts it) before starting, and ignore its optional details.
+    let serialized = serde_json::to_value(&session)?;
+    let path = serialized
+        .as_str()
+        .context("invalid portal session path")?
+        .to_owned();
+    let session_proxy = zbus::Proxy::new_owned(
+        screencast.connection().clone(),
+        "org.freedesktop.portal.Desktop",
+        path,
+        "org.freedesktop.portal.Session",
+    )
+    .await?;
+    let closed = session_proxy.receive_signal("Closed").await?;
     let cursor_mode = preferred_cursor_mode(screencast).await?;
 
     screencast
@@ -426,7 +458,13 @@ async fn negotiate(
         .open_pipe_wire_remote(&session)
         .await
         .context("opening the PipeWire remote")?;
-    Ok((fd, node, fresh_token, session))
+    Ok(PortalCapture {
+        fd,
+        node,
+        restore_token: fresh_token,
+        session,
+        closed,
+    })
 }
 
 pub(crate) fn source_type(value: &str) -> ashpd::desktop::screencast::SourceType {
