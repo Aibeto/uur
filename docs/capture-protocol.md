@@ -69,3 +69,9 @@ does not trigger this watchdog. Recovery keeps the saved token and performs no
 token-less fallback or switch to direct capture. The portal controls whether
 restoring that choice requires confirmation. A portal Session.Closed signal
 ends sharing; the user starts a new session explicitly.
+
+When Mutter's DisplayConfig service is already present, the supervisor also
+subscribes to MonitorsChanged and proactively restores capture after a layout
+change. It coalesces signals during the reconnect delay. Stop requests and an
+already-received Session.Closed signal take priority over layout recovery. This
+optional listener never starts a GNOME service on other desktops.

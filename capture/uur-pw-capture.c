@@ -36,6 +36,9 @@
 #include "../hook/frame-protocol.h"
 
 #define FRAME_FORMAT_BGRX 1
+#ifndef SPA_CHUNK_FLAG_EMPTY
+#define SPA_CHUNK_FLAG_EMPTY (1u << 1)
+#endif
 
 struct frame_header {
     uint32_t magic;
@@ -349,7 +352,7 @@ static void on_param_changed(void *userdata, uint32_t id,
     /* The DMA-BUF path mmaps the fd directly, which is only correct for a
      * linear layout.  A tiled modifier needs a real importer (GBM/EGL), so
      * refuse to publish garbage rather than emit a corrupt frame. */
-    c->dmabuf_usable = (info.flags & SPA_VIDEO_FLAG_MODIFIER) &&
+    c->dmabuf_usable = spa_pod_find_prop(param, NULL, SPA_FORMAT_VIDEO_modifier) != NULL &&
                        info.modifier == DRM_FORMAT_MOD_LINEAR;
     fprintf(stderr, "negotiated: %ux%u stride %u modifier %#llx%s\n", c->width,
             c->height, c->stride, (unsigned long long)info.modifier,

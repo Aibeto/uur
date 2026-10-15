@@ -13,7 +13,7 @@
 //! a headless remote host.
 
 use anyhow::{anyhow, Context, Result};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
@@ -76,6 +76,7 @@ pub fn run() -> Result<()> {
     runtime.block_on(async {
         let frames = frame_path()?;
         let mut failures = 0;
+        let mut display_changes = watch_display_changes().await;
         loop {
             let opened = tokio::select! {
                 result = portal_session(&mut config, failures == 0) => result,
@@ -103,11 +104,17 @@ pub fn run() -> Result<()> {
             let mut helper = CaptureHelper(spawn_helper(pw_fd, node)?);
             let mut healthy_since = None;
             let mut portal_closed = false;
+            let mut reconfigure = false;
             let status = loop {
                 tokio::select! {
+                    biased;
                     _ = wait_for_stop(&stopping) => break None,
                     _ = closed.next() => {
                         portal_closed = true;
+                        break None;
+                    }
+                    _ = next_display_change(&mut display_changes) => {
+                        reconfigure = true;
                         break None;
                     }
                     _ = tokio::time::sleep(Duration::from_millis(50)) => {
@@ -138,20 +145,74 @@ pub fn run() -> Result<()> {
                 failures = 0;
             }
             failures += 1;
-            let status = status.context("capture helper stopped without an exit status")?;
-            if failures > 3 || !matches!(status.code(), Some(0 | 75) | None) {
-                anyhow::bail!(
-                    "{} ({status}); capture recovery stopped",
-                    t!("capture.helper_failed")
-                );
+            if failures > 3 {
+                anyhow::bail!("capture recovery failed repeatedly; restart uur run to share again");
             }
-            eprintln!("capture stream interrupted ({status}); reconnecting {failures}/3");
+            if reconfigure {
+                eprintln!("display configuration changed; restoring capture {failures}/3");
+            } else {
+                let status = status.context("capture helper stopped without an exit status")?;
+                if !matches!(status.code(), Some(0 | 75) | None) {
+                    anyhow::bail!(
+                        "{} ({status}); capture recovery stopped",
+                        t!("capture.helper_failed")
+                    );
+                }
+                eprintln!("capture stream interrupted ({status}); reconnecting {failures}/3");
+            }
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {},
                 _ = wait_for_stop(&stopping) => return Ok(()),
             }
+            // Several signals can describe one layout transaction. The next
+            // handshake reads the final layout rather than replaying each one.
+            if reconfigure {
+                while let Some(stream) = display_changes.as_mut() {
+                    match stream.next().now_or_never() {
+                        Some(Some(_)) => {}
+                        Some(None) => {
+                            display_changes = None;
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
         }
     })
+}
+
+async fn watch_display_changes() -> Option<zbus::proxy::SignalStream<'static>> {
+    let connection = zbus::Connection::session().await.ok()?;
+    let bus = zbus::fdo::DBusProxy::new(&connection).await.ok()?;
+    let name = "org.gnome.Mutter.DisplayConfig".try_into().ok()?;
+    if !bus.name_has_owner(name).await.ok()? {
+        return None;
+    }
+    drop(bus);
+    let proxy = zbus::Proxy::new_owned(
+        connection,
+        "org.gnome.Mutter.DisplayConfig",
+        "/org/gnome/Mutter/DisplayConfig",
+        "org.gnome.Mutter.DisplayConfig",
+    )
+    .await
+    .ok()?;
+    proxy.receive_signal("MonitorsChanged").await.ok()
+}
+
+async fn next_display_change(changes: &mut Option<zbus::proxy::SignalStream<'static>>) {
+    loop {
+        match changes.as_mut() {
+            Some(stream) => {
+                if stream.next().await.is_some() {
+                    return;
+                }
+                *changes = None;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
 }
 
 async fn wait_for_stop(stopping: &AtomicBool) {
